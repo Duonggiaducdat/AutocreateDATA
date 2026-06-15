@@ -1,0 +1,55 @@
+#server:
+#  port: 8080
+#  servlet:
+#    context-path: /
+
+server:
+  address: 0.0.0.0
+  port: 8080
+  servlet:
+    context-path: /
+
+spring:
+  application:
+    name: auto-create-data-backend
+  jackson:
+    default-property-inclusion: non_null
+  web:
+    resources:
+      # Disable browser caching of static assets so refresh always picks up
+      # the latest HTML/JS/CSS. Flip to true for production.
+      cache:
+        cachecontrol:
+          no-cache: true
+          no-store: true
+          must-revalidate: true
+
+# ---- Application config ---------------------------------------------------
+autodata:
+  # Frontend origins allowed to call the API (CORS).
+  cors:
+    allowed-origins:
+#      - "*"
+      - http://localhost:5173
+      - http://localhost:3000
+      - http://127.0.0.1:5500
+      - http://localhost:8081
+      - http://172.30.38.157:8080
+  webdriver:
+    headless: true
+    implicit-wait-seconds: 5
+    page-load-timeout-seconds: 60
+    base-url: https://ftms-stag.fpt.net
+    screenshot-on-error: true
+    screenshot-dir: screenshots
+  # Default credentials surface as form defaults — overridable per request.
+  defaults:
+    reviewer-username: reviewer01@fpt.com
+    reviewer-password: REDACTED_OTP_CODE
+
+logging:
+  level:
+    base: DEBUG
+    pages: DEBUG
+    com.fpt.autodata: DEBUG
+    org.openqa.selenium: WARN

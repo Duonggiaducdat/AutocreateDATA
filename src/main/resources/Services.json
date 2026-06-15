@@ -1,0 +1,79 @@
+{
+  "group": {
+    "Trung tâm dữ liệu": {
+      "services": [
+        "CDN",
+        "Dedicated",
+        "Colocation",
+        "Rack",
+        "X-Connect"
+      ],
+      "allowsRackOption": true,
+      "rackOptions": ["Ít hơn 1 tủ", "Nhiều hơn hoặc bằng 1 tủ"]
+    },
+    "Kênh truyền": {
+      "services": [
+        "SD WAN_ILL",
+        "Cloud connect",
+        "Truyền số liệu - MPLS Layer 3",
+        "Truyền số liệu - P2P",
+        "Truyền số liệu - Carier Ethernet",
+        "Truyền số liệu - MPLS",
+        "Truyền số liệu - MPLS Layer 2",
+        "Truyen dan - IPLC",
+        "Truyen dan - IEPL",
+        "Truyen dan - SDH",
+        "Truyen dan - WDM",
+        "Internet - NIX Only",
+        "Internet - IP Transit",
+        "Internet - GIA NIX",
+        "Internet - GIA Only",
+        "Internet - Peering",
+        "Internet - 3G",
+        "Internet - FTTH",
+        "SDWAN40",
+        "SDWAN70",
+        "SDWAN120",
+        "SDWAN200",
+        "Internet Vệ Tinh – FPT Starlink"
+      ],
+      "allowsRackOption": false
+    },
+    "Cloud partner": {
+      "services": [
+        "Google Workspace",
+        "Google Cloud Platform",
+        "Cloudflare",
+        "Windows 365",
+        "Azure",
+        "Office 365",
+        "AI",
+        "BytePlus",
+        "Alibaba Cloud",
+        "Cloud GPU"
+      ],
+      "allowsRackOption": false
+    },
+    "Tổng đài": {
+      "services": [
+        "3CX",
+        "PBX",
+        "OnCallCX",
+        "Voice OTP",
+        "AutoCall",
+        "CloudCX",
+        "Tổng đài OnCall",
+        "OnCX"
+      ],
+      "allowsRackOption": false
+    },
+    "Điện toán đám mây": {
+      "services": ["Hosting/Email", "FPT HI GIO CLOUD"],
+      "allowsRackOption": false
+    },
+    "Đầu số thoại": {
+      "services": ["1800", "1900", "CSKH","Điện thoại cố định"],
+      "allowsRackOption": false
+    }
+  }
+}

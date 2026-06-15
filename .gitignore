@@ -1,0 +1,9 @@
+target/
+*.log
+*.gz
+screenshots/
+logs/
+.idea/
+*.iml
+ThongtinHD
+~$*
