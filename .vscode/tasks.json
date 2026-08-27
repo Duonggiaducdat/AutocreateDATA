@@ -1,0 +1,57 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run Server",
+      "type": "shell",
+      "command": "java -jar ${workspaceFolder}/target/auto-create-data-backend-1.0.0.jar",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "runOptions": {
+        "runOn": "folderOpen"
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "showReuseMessage": false,
+        "clear": true
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "pattern": {
+          "regexp": "^$"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "Starting AutoDataApplication",
+          "endsPattern": "Started AutoDataApplication"
+        }
+      }
+    },
+    {
+      "label": "Watch Audit Log",
+      "type": "shell",
+      "command": "touch ${workspaceFolder}/audit.jsonl && tail -f ${workspaceFolder}/audit.jsonl",
+      "presentation": {
+        "reveal": "always",
+        "panel": "new",
+        "showReuseMessage": false
+      }
+    },
+    {
+      "label": "Run + Watch Log",
+      "dependsOn": ["Run Server", "Watch Audit Log"],
+      "dependsOrder": "parallel",
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    }
+  ]
+}
