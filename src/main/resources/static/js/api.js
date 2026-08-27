@@ -43,6 +43,26 @@
       return this._fetchJson('/api/services', { method: 'GET' });
     }
 
+    /** Returns recent audit entries (newest first). */
+    listLog(n = 50) {
+      return this._fetchJson(`/api/log?n=${n}`, { method: 'GET' });
+    }
+
+    /**
+     * Proxies any `GET` lookup on the real BMS API through our backend
+     * (avoids CORS — see GenerationController#apiProxy).
+     * @param {string} path e.g. 'master-data/service-types/groups' or
+     *   'bam/employees/Sale01%40fpt.com/department-managers' (caller must
+     *   encodeURIComponent any path segment that isn't a literal slash)
+     * @param {string} bearerToken same token pasted into the opportunity.api card
+     */
+    proxy(path, bearerToken) {
+      return this._fetchJson('/api/proxy/' + path, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer ' + bearerToken },
+      });
+    }
+
     /**
      * Execute a single generator.
      * @param {string} type

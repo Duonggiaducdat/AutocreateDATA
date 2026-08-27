@@ -27,7 +27,7 @@
   const READ_TYPES = new Set(['detail.get-mach', 'detail.get-mayc', 'detail.get-href']); // optional read-style accent
 
   function renderField(spec, values, onChange) {
-    const wrap = h('label', { class: 'd-block' });
+    const wrap = h('label', { class: 'd-block', dataset: { field: spec.name } });
     wrap.appendChild(h('div', { class: 'field-label' },
       h('span', { class: 'lbl' }, spec.label || spec.name),
       spec.hint ? h('span', { class: 'hint' }, spec.hint) : null
@@ -171,13 +171,26 @@
       const old = card.querySelector('.gen-result');
       if (old) old.remove();
 
-      const pre = h('pre', null, error
-        ? `error: ${error.message || error}`
-        : JSON.stringify(result, null, 2));
+      // opportunity.api (and any future generator returning the same shape):
+      // surface the created code + a clickable link front-and-center. When
+      // that's available, that IS the result — skip the raw JSON dump
+      // entirely (still shown for errors, or generators without this shape).
+      const code = !error && result && result.data && result.data.opportunityCode;
+      const link = !error && result && result.data && result.data.link;
+      const successBanner = code
+        ? h('div', { class: 'gen-result-banner' },
+            h('span', null, 'Mã cơ hội: '),
+            h('strong', null, code),
+            link ? h('a', { href: link, target: '_blank', rel: 'noopener' }, 'Mở trong BMS →') : null
+          )
+        : null;
+
+      const copyText = code ? (link || code) : (error ? `error: ${error.message || error}` : JSON.stringify(result, null, 2));
+      const pre = successBanner ? null : h('pre', null, copyText);
 
       const copyBtn = h('button', { class: 'icon-btn', type: 'button' }, 'copy');
       copyBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(pre.textContent).then(
+        navigator.clipboard.writeText(copyText).then(
           () => { copyBtn.textContent = 'copied ✓'; setTimeout(() => copyBtn.textContent = 'copy', 1200); },
           () => { copyBtn.textContent = 'failed'; }
         );
@@ -191,6 +204,7 @@
           h('span', { class: 'label' }, error ? 'Error' : 'Result'),
           h('div', { class: 'gen-result-actions' }, copyBtn, clearBtn)
         ),
+        successBanner,
         pre
       );
       card.appendChild(panel);
@@ -475,6 +489,212 @@
     return card;
   }
 
+  /* ---------- service group/type picker (opportunity.api only) -----------
+   * The generic renderField() already put a plain text input under
+   * data-field="services" (raw "group:type,group:type" CSV — still works and
+   * stays as a manual/advanced fallback). This bolts 2 real cascading
+   * dropdowns ABOVE it, matching the actual BMS "Nhóm dịch vụ"/"Loại dịch vụ"
+   * UI, and writes the picked pairs back into that same text input so the
+   * rest of the generic card (values collection, Generate button) needs no
+   * changes at all.
+   *
+   * loadCatalog(token) must resolve to { groups: [{id, label, types:[{id,label}]}] }
+   * — normalization of whatever shape the real BMS endpoint returns happens
+   * in app.js (this file stays HTTP-agnostic), see normalizeServiceCatalog().
+   */
+  function mountServicePicker(card, { loadCatalog, getToken }) {
+    const servicesWrap = card.querySelector('[data-field="services"]');
+    const tokenWrap = card.querySelector('[data-field="bearerToken"]');
+    if (!servicesWrap) return;
+    const rawInput = servicesWrap.querySelector('input');
+    if (!rawInput) return;
+
+    let catalog = null; // { groups: [...] }
+    let picked = [];    // [{groupId, groupLabel, typeId, typeLabel}]
+
+    function syncRawInput() {
+      rawInput.value = picked.map(p => `${p.groupId}:${p.typeId}`).join(',');
+      rawInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    function renderChips() {
+      chipsHost.innerHTML = '';
+      if (picked.length === 0) {
+        chipsHost.appendChild(h('span', { class: 'no-params' }, 'Chưa chọn dịch vụ nào — chọn Nhóm rồi Loại ở trên, bấm "+ Thêm dịch vụ".'));
+        return;
+      }
+      picked.forEach((p, i) => {
+        const chip = h('span', { class: 'chip on' },
+          `${p.groupLabel} → ${p.typeLabel} `,
+          h('span', { style: 'cursor:pointer;opacity:.7;', onclick: () => { picked.splice(i, 1); renderChips(); syncRawInput(); } }, '✕')
+        );
+        chipsHost.appendChild(chip);
+      });
+    }
+
+    const groupSelect = h('select', { class: 'app-select' },
+      h('option', { value: '' }, catalog ? 'Chọn nhóm dịch vụ…' : 'Điền Bearer Token để tự tải…'));
+    const typeSelect = h('select', { class: 'app-select', disabled: true },
+      h('option', { value: '' }, '— chọn nhóm trước —'));
+    const addBtn = h('button', { class: 'icon-btn', type: 'button', disabled: true }, '+ Thêm dịch vụ');
+    const statusEl = h('span', { class: 'hint' });
+    const chipsHost = h('div', { class: 'chips', style: 'margin-top:6px;' });
+
+    groupSelect.addEventListener('change', () => {
+      const g = catalog && catalog.groups.find(x => String(x.id) === groupSelect.value);
+      typeSelect.innerHTML = '';
+      if (!g) {
+        typeSelect.appendChild(h('option', { value: '' }, '— chọn nhóm trước —'));
+        typeSelect.disabled = true;
+        addBtn.disabled = true;
+        return;
+      }
+      typeSelect.appendChild(h('option', { value: '' }, 'Chọn loại dịch vụ…'));
+      (g.types || []).forEach(t => typeSelect.appendChild(h('option', { value: t.id }, t.label)));
+      typeSelect.disabled = false;
+      addBtn.disabled = true;
+    });
+    typeSelect.addEventListener('change', () => { addBtn.disabled = !typeSelect.value; });
+
+    addBtn.addEventListener('click', () => {
+      const g = catalog.groups.find(x => String(x.id) === groupSelect.value);
+      const t = g && (g.types || []).find(x => String(x.id) === typeSelect.value);
+      if (!g || !t) return;
+      picked.push({ groupId: g.id, groupLabel: g.label, typeId: t.id, typeLabel: t.label });
+      renderChips();
+      syncRawInput();
+    });
+
+    let loading = false;
+    async function triggerLoad() {
+      const token = getToken();
+      if (!token) { statusEl.textContent = 'Dán Bearer Token trước đã.'; return; }
+      if (loading) return;
+      loading = true;
+      statusEl.textContent = 'Đang tải…';
+      try {
+        catalog = await loadCatalog(token);
+        groupSelect.innerHTML = '';
+        groupSelect.appendChild(h('option', { value: '' }, 'Chọn nhóm dịch vụ…'));
+        catalog.groups.forEach(g => groupSelect.appendChild(h('option', { value: g.id }, g.label)));
+        statusEl.textContent = `Đã tải ${catalog.groups.length} nhóm dịch vụ ✓`;
+      } catch (err) {
+        statusEl.textContent = 'Lỗi: ' + (err.message || err);
+      } finally {
+        loading = false;
+      }
+    }
+
+    // No manual "load" button — auto-triggered from app.js when Bearer Token
+    // loses focus (see mountOpportunityPickers).
+    const selectRow = h('div', { class: 'field-grid' }, groupSelect, typeSelect);
+
+    servicesWrap.insertAdjacentElement('afterend', h('div', { class: 'service-picker' },
+      h('div', { class: 'field-label' }, h('span', { class: 'lbl' }, 'Dịch vụ (Nhóm → Loại)'), statusEl),
+      selectRow, addBtn, chipsHost
+    ));
+
+    renderChips();
+    return { reload: triggerLoad };
+  }
+
+  /* ---------- flat async picker (AM / TPP / BGĐ) ----------
+   * Same idea as mountServicePicker but for flat username lists instead of a
+   * group→type cascade. `multi:false` (AM/saleName) just writes the picked
+   * username straight into the underlying text input. `multi:true`
+   * (tppCanApproval/usersCanApproval) accumulates chips, writes a
+   * comma-separated list — matches what those fields already accepted by hand.
+   *
+   * loadOptions(token) must resolve to [{id, label}] — id is what gets written
+   * into the raw input (BMS wants usernames like "ducnta", not display names).
+   */
+  function mountAsyncPicker(card, fieldName, { loadOptions, getToken, multi }) {
+    const wrap = card.querySelector(`[data-field="${fieldName}"]`);
+    if (!wrap) return;
+    const rawInput = wrap.querySelector('input');
+    if (!rawInput) return;
+
+    let options = [];
+    let picked = multi ? (rawInput.value ? rawInput.value.split(',').map(s => s.trim()).filter(Boolean) : []) : null;
+
+    const select = h('select', { class: 'app-select' },
+      h('option', { value: '' }, 'Điền Bearer Token + AM để tự tải…'));
+    select.disabled = true;
+    const statusEl = h('span', { class: 'hint' });
+    const chipsHost = multi ? h('div', { class: 'chips', style: 'margin-top:6px;' }) : null;
+
+    function renderChips() {
+      if (!chipsHost) return;
+      chipsHost.innerHTML = '';
+      if (picked.length === 0) {
+        chipsHost.appendChild(h('span', { class: 'no-params' }, '(chưa chọn ai — bấm "Tải danh sách" rồi chọn ở dropdown trên)'));
+        return;
+      }
+      picked.forEach((username, i) => {
+        const opt = options.find(o => String(o.id) === String(username));
+        chipsHost.appendChild(h('span', { class: 'chip on' },
+          (opt ? `${opt.label} (${username})` : username) + ' ',
+          h('span', { style: 'cursor:pointer;opacity:.7;', onclick: () => { picked.splice(i, 1); renderChips(); syncRawInput(); } }, '✕')
+        ));
+      });
+    }
+
+    function syncRawInput() {
+      rawInput.value = multi ? picked.join(',') : (picked || '');
+      rawInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+
+    select.addEventListener('change', () => {
+      if (!select.value) return;
+      if (multi) {
+        if (!picked.includes(select.value)) picked.push(select.value);
+        renderChips();
+      } else {
+        picked = select.value;
+      }
+      syncRawInput();
+      select.value = '';
+    });
+
+    let loading = false;
+    async function triggerLoad() {
+      const token = getToken();
+      if (!token) { statusEl.textContent = 'Dán Bearer Token trước đã.'; return; }
+      if (loading) return;
+      loading = true;
+      statusEl.textContent = 'Đang tải…';
+      select.disabled = true;
+      try {
+        options = await loadOptions(token);
+        select.innerHTML = '';
+        select.appendChild(h('option', { value: '' }, multi ? '+ thêm người…' : 'Chọn…'));
+        options.forEach(o => select.appendChild(h('option', { value: o.id }, `${o.label} (${o.id})`)));
+        select.disabled = false;
+        statusEl.textContent = `Đã tải ${options.length} người ✓`;
+      } catch (err) {
+        statusEl.textContent = 'Lỗi: ' + (err.message || err);
+      } finally {
+        loading = false;
+      }
+    }
+
+    // No manual "load" button — auto-triggered from app.js when Bearer
+    // Token / AM lose focus (see mountOpportunityPickers). `rawInput` stays
+    // in the DOM (just invisible) since it's still the actual write-target
+    // `values` reads from.
+    const originalLabel = (wrap.querySelector('.field-label .lbl') || {}).textContent || fieldName;
+    wrap.classList.add('d-none');
+
+    wrap.insertAdjacentElement('afterend', h('div', { class: 'service-picker' },
+      h('div', { class: 'field-label' }, h('span', { class: 'lbl' }, originalLabel), statusEl),
+      select,
+      chipsHost
+    ));
+    if (chipsHost) renderChips();
+
+    return { reload: triggerLoad };
+  }
+
   /* ---------- catalog grouping & rendering ---------- */
   function renderCatalog(host, generators, handlers) {
     host.innerHTML = '';
@@ -536,7 +756,7 @@
     pill.textContent = label;
   }
 
-  global.AutoDataUI = { h, renderCard, renderMasterCard, renderCatalog, renderCategoryRow, toast, setHealth };
+  global.AutoDataUI = { h, renderCard, renderMasterCard, renderCatalog, renderCategoryRow, toast, setHealth, mountServicePicker, mountAsyncPicker };
 })(window);
 //      const section = h('section', null,
 //        h('div', { class: 'cat-header' },
