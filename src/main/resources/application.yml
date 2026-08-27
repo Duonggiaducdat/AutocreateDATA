@@ -42,6 +42,12 @@ autodata:
     base-url: https://ftms-stag.fpt.net
     screenshot-on-error: true
     screenshot-dir: screenshots
+  # Direct REST calls to the BMS backend — bypasses Selenium entirely.
+  # Used by API-based generators (opportunity.api) which are far more
+  # reliable than driving the UI through WebDriver.
+  api:
+    base-url: https://ftisapi-stag.fpt.net/bms-service/api
+    timeout-seconds: 15
   # Default credentials surface as form defaults — overridable per request.
   defaults:
     reviewer-username: chuyennt5@fpt.com

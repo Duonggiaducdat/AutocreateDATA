@@ -20,12 +20,16 @@ public class AutodataProperties {
 
     private Cors cors = new Cors();
     private WebDriver webdriver = new WebDriver();
+    private Api api = new Api();
 
     public Cors getCors() { return cors; }
     public void setCors(Cors cors) { this.cors = cors; }
 
     public WebDriver getWebdriver() { return webdriver; }
     public void setWebdriver(WebDriver webdriver) { this.webdriver = webdriver; }
+
+    public Api getApi() { return api; }
+    public void setApi(Api api) { this.api = api; }
 
     /* ----------------------------------------------------------------- */
 
@@ -74,5 +78,25 @@ public class AutodataProperties {
 
         public String getScreenshotDir() { return screenshotDir; }
         public void setScreenshotDir(String v) { this.screenshotDir = v; }
+    }
+
+    /* ----------------------------------------------------------------- */
+
+    /**
+     * Bound to {@code autodata.api.*} — direct REST calls to the BMS backend,
+     * bypassing Selenium entirely. Used by API-based generators (e.g.
+     * {@code opportunity.api}) which are far less flaky than the WebDriver path.
+     */
+    public static class Api {
+        /** Base URL for direct BMS REST calls (no Selenium involved). */
+        private String baseUrl = "https://ftisapi-stag.fpt.net/bms-service/api";
+        /** Request timeout in seconds for direct API calls. */
+        private int timeoutSeconds = 15;
+
+        public String getBaseUrl() { return baseUrl; }
+        public void setBaseUrl(String baseUrl) { this.baseUrl = baseUrl; }
+
+        public int getTimeoutSeconds() { return timeoutSeconds; }
+        public void setTimeoutSeconds(int v) { this.timeoutSeconds = v; }
     }
 }

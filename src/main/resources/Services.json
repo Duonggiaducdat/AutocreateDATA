@@ -74,6 +74,22 @@
     "Đầu số thoại": {
       "services": ["1800", "1900", "CSKH","Điện thoại cố định"],
       "allowsRackOption": false
-    }
+    },
+"Hợp đồng tích hợp/dự án": {
+  "services": [
+    "Gói LL",
+    "testVoice",
+    "iVoice+SM+CSKH_OnMeeting",
+    "MESLL",
+    "H_Ivoice+LL",
+    "BRN-MOMT",
+    "Gói 10 - 4 dịch vụ đó nha HuyenNHK",
+    "Fdrive + VDS",
+    "Gói dịch vụ 1306",
+    "ATTT + Win 365 + CSKH + HĐ ĐTử",
+    "HD tích hợp LL kenh truyen"
+  ],
+  "allowsRackOption": false
+}
   }
 }
