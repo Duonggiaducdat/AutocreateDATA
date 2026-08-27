@@ -159,6 +159,30 @@ code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 
 /* ---------- form ---------- */
 .gen-body { padding: 0 18px 6px; display: grid; gap: 12px; }
+
+/* opportunity.api has ~16 params — lay short fields out 2-3 per row instead
+   of one long single-column stack. Fields with picker/chip UI injected below
+   them (bearerToken, description, tppCanApproval, usersCanApproval,
+   userReceiveNotification) and anything the pickers themselves insert
+   (.service-picker / .field-grid / .chips as direct children of .gen-body)
+   stay full-width so they have room to breathe. */
+.gen-card[data-type="opportunity.api"] .gen-body {
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  align-items: start;
+}
+.gen-card[data-type="opportunity.api"] .gen-body > [data-field="bearerToken"],
+.gen-card[data-type="opportunity.api"] .gen-body > [data-field="description"],
+.gen-card[data-type="opportunity.api"] .gen-body > [data-field="tppCanApproval"],
+.gen-card[data-type="opportunity.api"] .gen-body > [data-field="usersCanApproval"],
+.gen-card[data-type="opportunity.api"] .gen-body > [data-field="userReceiveNotification"],
+.gen-card[data-type="opportunity.api"] .gen-body > .service-picker,
+.gen-card[data-type="opportunity.api"] .gen-body > .field-grid,
+.gen-card[data-type="opportunity.api"] .gen-body > .chips {
+  grid-column: 1 / -1;
+}
+@media (max-width: 640px) {
+  .gen-card[data-type="opportunity.api"] .gen-body { grid-template-columns: 1fr; }
+}
 .field-label {
   display: flex; align-items: baseline; justify-content: space-between;
   margin-bottom: 5px;
@@ -169,6 +193,13 @@ code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 }
 .field-label .hint {
   font-size: 9px; color: var(--ink-400); font-family: 'JetBrains Mono', monospace;
+}
+
+.am-hint {
+  margin-top: 4px;
+  font-size: 10px;
+  color: var(--ink-400);
+  font-family: 'JetBrains Mono', monospace;
 }
 
 .app-input,
@@ -188,6 +219,7 @@ code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
   box-shadow: 0 0 0 .15rem rgba(163,230,53,.18);
 }
 .app-input::placeholder { color: var(--ink-400); }
+.app-input.is-locked { background: var(--ink-800); color: var(--ink-300); cursor: not-allowed; }
 
 .range-row { display: flex; align-items: center; gap: 12px; }
 .range-row input[type=range] { flex: 1; accent-color: var(--lime-500); }
@@ -289,6 +321,38 @@ code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 }
 
 .gen-result.is-error pre { color: var(--coral-400); }
+
+.gen-result-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 12px; font-size: 13px; color: var(--ink-100);
+  background: rgba(163,230,53,.08); border-bottom: 1px solid rgba(163,230,53,.25);
+}
+.gen-result-banner strong {
+  font-family: 'JetBrains Mono', monospace; color: var(--lime-400); font-size: 14px;
+}
+.gen-result-banner a {
+  margin-left: auto; color: var(--lime-400); text-decoration: none;
+  font-size: 12px; font-weight: 600;
+}
+.gen-result-banner a:hover { text-decoration: underline; }
+
+/* ---------- auto-flow (Đánh giá / Phê duyệt) checkboxes + status ---------- */
+.autoflow-options {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 0 18px 12px; margin-top: -2px;
+}
+.autoflow-check {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; color: var(--ink-300); cursor: pointer;
+}
+.autoflow-check input { accent-color: var(--lime-500); cursor: pointer; }
+
+.autoflow-status {
+  padding: 4px 12px 10px; display: grid; gap: 4px;
+  font-family: 'JetBrains Mono', monospace; font-size: 11px;
+}
+.autoflow-line { color: var(--ink-300); }
+.autoflow-line.is-error { color: var(--coral-400); }
 
 /* ---------- toast ---------- */
 .app-toast {
