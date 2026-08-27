@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "java",
+      "name": "Run AutoCreate DATA",
+      "request": "launch",
+      "mainClass": "com.fpt.autodata.AutoDataApplication",
+      "projectName": "auto-create-data-backend"
+    }
+  ]
+}
