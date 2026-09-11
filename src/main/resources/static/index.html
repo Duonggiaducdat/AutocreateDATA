@@ -25,13 +25,16 @@
   <!-- ============== TOP NAV ============== -->
   <nav class="navbar navbar-expand-lg sticky-top app-nav">
     <div class="container-xl">
-      <a class="navbar-brand d-flex align-items-center gap-2" href="#">
+      <a id="nav-home" class="navbar-brand d-flex align-items-center gap-2" href="#">
         <span class="brand-mark">A</span>
         <span class="brand-text">
           <span class="brand-title">Auto-Create DATA</span>
           <span class="brand-sub">Generator Studio</span>
         </span>
       </a>
+      <div class="d-flex align-items-center gap-3 ms-3">
+        <a id="nav-ivoice" href="#" class="nav-page-link">Ivoice</a>
+      </div>
       <div class="ms-auto d-flex align-items-center gap-2">
         <input id="search" type="search" class="form-control form-control-sm app-search"
                placeholder="search type, class, signature…" autocomplete="off"/>
@@ -40,8 +43,16 @@
     </div>
   </nav>
 
+  <!-- ============== IVOICE PAGE (hidden until "Ivoice" nav clicked) ============== -->
+  <main id="ivoice-page" class="container-xl pt-5 pb-5" hidden>
+    <a href="#" id="ivoice-back" class="nav-page-link">← Trang chính</a>
+    <div class="eyebrow" style="margin-top:1rem;">Yêu cầu tạo HĐ/PL — bước "Thêm chi tiết"</div>
+    <h1 class="display-1 hero-title mb-4">Ivoice</h1>
+    <div id="ivoice-page-host"></div>
+  </main>
+
   <!-- ============== HERO ============== -->
-  <header class="container-xl pt-5 pb-4">
+  <header id="home-hero" class="container-xl pt-5 pb-4">
     <div class="eyebrow">A UI for the Selenium pipeline</div>
     <h1 class="display-1 hero-title mb-3">
       One card per generator. <em>Every parameter</em>, exposed.
@@ -68,7 +79,7 @@
   </main>
 
   <!-- ============== ACTIVITY LOG ============== -->
-  <section class="container-xl pb-5" style="margin-top:2rem;">
+  <section id="home-activity-log" class="container-xl pb-5" style="margin-top:2rem;">
     <div class="d-flex align-items-center justify-content-between mb-3">
       <div>
         <div class="eyebrow">Audit</div>

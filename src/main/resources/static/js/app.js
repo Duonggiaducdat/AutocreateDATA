@@ -56,6 +56,38 @@
 
   const DEFAULT_OTP_PASSWORD = 'REDACTED_OTP_CODE';
 
+  /* ---------- random test-data helpers (user request 2026-09-03: pre-fill
+     the Ivoice card's contact/IP/date fields so there's nothing left to
+     type by hand) ---------- */
+  const RAND_GIVEN_NAMES = ['An', 'Binh', 'Chi', 'Dung', 'Giang', 'Hoa', 'Khang', 'Linh', 'Minh', 'Nam', 'Phuc', 'Quyen', 'Thao', 'Tuan', 'Yen'];
+  const RAND_SURNAMES = ['Nguyen', 'Tran', 'Le', 'Pham', 'Hoang', 'Vu', 'Dang', 'Bui', 'Do', 'Ngo'];
+  function randVnName() {
+    // No digits — same person-name validation pattern documented for the
+    // BMS/CM contact fields (digits get 400'd), so keep it letters-only.
+    const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+    return `${pick(RAND_SURNAMES)} Van ${pick(RAND_GIVEN_NAMES)}`;
+  }
+  function randVnPhone() {
+    return '09' + String(Math.floor(10000000 + Math.random() * 89999999));
+  }
+  function randEmail(nameHint) {
+    const slug = (nameHint || 'qa').toLowerCase().replace(/[^a-z0-9]+/g, '') + Math.floor(Math.random() * 9999);
+    return `${slug}@example-test.vn`;
+  }
+  function randHouseNumber() {
+    return String(1 + Math.floor(Math.random() * 300));
+  }
+  function randIp() {
+    const octet = () => Math.floor(Math.random() * 254) + 1;
+    return `10.${octet()}.${octet()}.${octet()}`;
+  }
+  function todayMMDDYYYY() {
+    const d = new Date();
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    const dd = String(d.getDate()).padStart(2, '0');
+    return `${mm}/${dd}/${d.getFullYear()}`;
+  }
+
   /** Decodes a JWT's payload (no signature check — this is a client-side UX convenience, not a security boundary). Returns null on any parse failure. */
   function decodeJwt(token) {
     try {
@@ -79,6 +111,24 @@
       if (k.toLowerCase().endsWith(lower)) return payload[k];
     }
     return null;
+  }
+
+  // Cả ivoice.create-registration-detail (InsertRegistrationIframe) và
+  // bms.insert-registration (InsertRegistration) trả HTTP 200 ngay cả khi
+  // THẤT BẠI ở tầng nghiệp vụ — lỗi thật nằm trong body JSON, không phải
+  // status code. User report 2026-09-07: UI từng hiện nhầm ✓ cho case này.
+  // 2 hình dạng lỗi đã quan sát được sống:
+  //   IVOICE: {"code": 400, "data": "Tạo PĐK không thành công"}
+  //   BMS:    {"data": null, "status": "NotOk", "code": 401, "message": "..."}
+  function looksLikeFailureResponse(response) {
+    if (!response || typeof response !== 'object') return false;
+    if (response.status === 'NotOk') return true;
+    if (typeof response.code === 'number' && response.code >= 400) return true;
+    return false;
+  }
+  function responseFailureMessage(response) {
+    if (!response) return '';
+    return response.message || response.data || '';
   }
 
   /** Same short-username -> login-email normalization as amEmail() in mountOpportunityPickers. */
@@ -106,6 +156,22 @@
     const resp = await api.generate('auth.get-token', { username: email, password: DEFAULT_OTP_PASSWORD });
     const token = resp.result.data.token;
     tokenCache.set(email, { token, fetchedAt: Date.now() });
+    return { token, cached: false };
+  }
+
+  // Separate cache — the CM app issues a completely different JWT (extra
+  // TICKET/DVC/DPC claims) via auth.get-cm-token, not interchangeable with
+  // the bms-service one above. See GetCmTokenGenerator.java / memory/api-contracts.md.
+  const cmTokenCache = new Map(); // email -> { token, fetchedAt }
+
+  async function getCachedOrFreshCmToken(email) {
+    const cached = cmTokenCache.get(email);
+    if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) {
+      return { token: cached.token, cached: true };
+    }
+    const resp = await api.generate('auth.get-cm-token', { username: email, password: DEFAULT_OTP_PASSWORD });
+    const token = resp.result.data.cmToken;
+    cmTokenCache.set(email, { token, fetchedAt: Date.now() });
     return { token, cached: false };
   }
 
@@ -272,8 +338,1104 @@
          host.appendChild(apiWrapper);
          mountOpportunityPickers(apiCard);
        }
+
+       // Standalone card — NOT tied to opportunity.api's create flow, since
+       // it operates on a registration that already exists (see the create
+       // card below for the step that makes one); this card only covers the
+       // two APPROVE steps on whatever regCode the user already has sitting
+       // in "chờ duyệt HĐ/PL".
+       const hdplWrapper = document.createElement('div');
+       hdplWrapper.className = 'master-grid';
+       hdplWrapper.style.marginTop = '1.5rem';
+       hdplWrapper.appendChild(mountHdPlApprovalCard());
+       host.appendChild(hdplWrapper);
      }
 
+  // "Ivoice" — the create-detail step for "Đấu số thoại" services, on its
+  // own page (user request 2026-09-03: a nav-bar link, not another card
+  // stacked on the home page). Reverse-engineered 2026-09-03 from a real
+  // captured InsertRegistrationIframe request. 4 sub-loại per the same
+  // request: Điện thoại cố định / 1800 / 1900 / CSKH — only Điện thoại cố
+  // định has a captured payload so far, the other 3 render as "chưa hỗ
+  // trợ" until their own InsertRegistrationIframe body is captured the
+  // same way. Mounted once (not on every renderMaster() call).
+  function renderIvoicePage() {
+    const ivoiceHost = document.getElementById('ivoice-page-host');
+    if (!ivoiceHost || ivoiceHost.childElementCount > 0) return; // already mounted
+    const wrapper = document.createElement('div');
+    wrapper.className = 'master-grid';
+    // 1 card, 1 form duy nhất (user request 2026-09-07: "bên dưới điền
+    // luôn trong 1 form luôn chứ vậy chi cho lằng nhằng" — trước đó tách
+    // riêng 1 card "Xác định yêu cầu" + 1 card "Thêm chi tiết", không còn
+    // cần thiết từ khi phần hành động chỉ còn 1 nút).
+    wrapper.appendChild(mountIvoiceCard());
+    ivoiceHost.appendChild(wrapper);
+  }
+
+  /**
+   * Simple 2-page router (Home "/" / Ivoice "/ivoice") — real address-bar
+   * URL via the History API (user request 2026-09-03), not just a JS
+   * show/hide with no URL change. A direct hit or reload of "/ivoice"
+   * itself is handled server-side (see WebConfig#addViewControllers, which
+   * forwards it to the same index.html shell) — this just also has to
+   * show the right page ON LOAD when landing on that path, and keep
+   * back/forward browser buttons working via popstate.
+   */
+  function showPageFor(pathname) {
+    const isIvoice = pathname === '/ivoice';
+    if (isIvoice) renderIvoicePage();
+    document.getElementById('home-hero').hidden = isIvoice;
+    document.getElementById('catalog').hidden = isIvoice;
+    document.getElementById('home-activity-log').hidden = isIvoice;
+    document.getElementById('ivoice-page').hidden = !isIvoice;
+  }
+  function navigateTo(pathname) {
+    if (location.pathname !== pathname) history.pushState({}, '', pathname);
+    showPageFor(pathname);
+    window.scrollTo(0, 0);
+  }
+  function goToIvoicePage() { navigateTo('/ivoice'); }
+  function goToHomePage() { navigateTo('/'); }
+  document.getElementById('nav-ivoice').addEventListener('click', (e) => { e.preventDefault(); goToIvoicePage(); });
+  document.getElementById('nav-home').addEventListener('click', (e) => { e.preventDefault(); goToHomePage(); });
+  document.getElementById('ivoice-back').addEventListener('click', (e) => { e.preventDefault(); goToHomePage(); });
+  window.addEventListener('popstate', () => showPageFor(location.pathname));
+  showPageFor(location.pathname); // land directly on /ivoice (e.g. reload) shows the right page immediately
+
+  // Fixed lookup identity for registration.lookup — any authenticated BMS
+  // account can run that search regardless of assignment (confirmed live
+  // 2026-08-25), so reuse the same convention account already used for the
+  // CM step instead of asking the user to supply yet another login.
+  const HDPL_LOOKUP_EMAIL = 'admin01@fpt.com';
+
+  /**
+   * Card "Duyệt HĐ/PL (BMS + CM)" — user request 2026-08-27: identify by
+   * "Mã YC" (regCode) instead of opportunity code, auto-discover who the
+   * assigned BGĐ is (no more manual BGĐ input), auto-login as that BGĐ, and
+   * run straight through. Chain: registration.lookup (find opportunityId +
+   * registrationId + BGĐ username from regCode) → login as that BGĐ →
+   * registration.approve-bms → login as the CM account → registration.approve-cm.
+   * Hand-built (not the generic ParamSpec renderer) because it needs its own
+   * multi-role login orchestration, same spirit as runPostCreateFlow's
+   * per-step loginAs().
+   */
+  function mountHdPlApprovalCard() {
+    const regCodeInput = UI.h('input', { class: 'app-input', type: 'text', placeholder: 'vd: CMR2614586' });
+    const cmInput = UI.h('input', { class: 'app-input', type: 'text', value: 'admin01' });
+    const status = UI.h('div', { class: 'autoflow-status' });
+
+    const addLine = () => {
+      const line = UI.h('div', { class: 'autoflow-line' }, '');
+      status.appendChild(line);
+      return line;
+    };
+
+    const field = (labelText, input, hint) => UI.h('label', { class: 'd-block' },
+      UI.h('div', { class: 'field-label' },
+        UI.h('span', { class: 'lbl' }, labelText),
+        hint ? UI.h('span', { class: 'hint' }, hint) : null),
+      input);
+
+    const button = UI.h('button', {
+      class: 'btn-generate',
+      type: 'button',
+      onclick: async () => {
+        status.innerHTML = '';
+        const regCode = regCodeInput.value.trim();
+        const cmEmail = toLoginEmail(cmInput.value.trim());
+        if (!regCode || !cmEmail) {
+          const line = addLine();
+          line.textContent = '✗ Điền đủ Mã YC và tài khoản CM';
+          line.classList.add('is-error');
+          return;
+        }
+
+        button.disabled = true;
+        try {
+          const lookupLine = addLine();
+          lookupLine.textContent = `⏳ Đang tra Mã YC ${regCode}…`;
+          let opportunityId, bgdUsername;
+          try {
+            const { token } = await getCachedOrFreshToken(HDPL_LOOKUP_EMAIL);
+            const resp = await api.generate('registration.lookup', { bearerToken: token, regCode });
+            const d = resp.result.data;
+            opportunityId = d.opportunityId;
+            bgdUsername = d.bgdUsername;
+            lookupLine.textContent = `✓ Tìm thấy ${opportunityId} — BGĐ phụ trách: ${bgdUsername}` + (d.alreadyApproved ? ' (đã duyệt BMS từ trước)' : '');
+          } catch (err) {
+            lookupLine.textContent = '✗ Tra Mã YC lỗi: ' + (err.message || err);
+            lookupLine.classList.add('is-error');
+            return;
+          }
+
+          const bgdEmail = toLoginEmail(bgdUsername);
+          const bmsLine = addLine();
+          bmsLine.textContent = `⏳ Đăng nhập BGĐ (${bgdEmail})…`;
+          let bgdToken;
+          try {
+            const { token, cached } = await getCachedOrFreshToken(bgdEmail);
+            bgdToken = token;
+            bmsLine.textContent = cached ? `✓ Dùng lại token BGĐ (${bgdEmail}, còn hạn)` : `✓ Đăng nhập BGĐ thành công (${bgdEmail})`;
+          } catch (err) {
+            bmsLine.textContent = '✗ Đăng nhập BGĐ lỗi: ' + (err.message || err);
+            bmsLine.classList.add('is-error');
+            return;
+          }
+
+          const approveLine = addLine();
+          approveLine.textContent = '⏳ Đang duyệt HĐ/PL bên BMS…';
+          try {
+            const resp = await api.generate('registration.approve-bms', { bearerToken: bgdToken, opportunityId });
+            approveLine.textContent = `✓ BMS duyệt xong (${resp.result.data.registrations.length} registration)`;
+          } catch (err) {
+            approveLine.textContent = '✗ Duyệt BMS lỗi: ' + (err.message || err);
+            approveLine.classList.add('is-error');
+            return;
+          }
+
+          const cmLoginLine = addLine();
+          cmLoginLine.textContent = `⏳ Đăng nhập CM (${cmEmail})…`;
+          let cmToken;
+          try {
+            const { token, cached } = await getCachedOrFreshCmToken(cmEmail);
+            cmToken = token;
+            cmLoginLine.textContent = cached ? `✓ Dùng lại token CM (${cmEmail}, còn hạn)` : `✓ Đăng nhập CM thành công (${cmEmail})`;
+          } catch (err) {
+            cmLoginLine.textContent = '✗ Đăng nhập CM lỗi: ' + (err.message || err);
+            cmLoginLine.classList.add('is-error');
+            return;
+          }
+
+          const line = addLine();
+          line.textContent = `⏳ Đang duyệt CM cho ${regCode}…`;
+          try {
+            const resp = await api.generate('registration.approve-cm', { cmToken, regCode });
+            const d = resp.result.data;
+            line.textContent = d.skipped
+              ? `✓ ${regCode} đã hoàn thành từ trước (hợp đồng ${d.contractNo || '?'})`
+              : `✓ ${regCode} duyệt CM xong — hợp đồng ${d.contractNo || '?'} / PL ${d.subContractNo || '?'}`;
+          } catch (err) {
+            line.textContent = `✗ Duyệt CM lỗi cho ${regCode}: ` + (err.message || err);
+            line.classList.add('is-error');
+          }
+        } finally {
+          button.disabled = false;
+        }
+      },
+    }, 'Duyệt HĐ/PL');
+
+    return UI.h('article', { class: 'gen-card' },
+      UI.h('header', { class: 'gen-header' },
+        UI.h('div', { class: 'd-flex justify-content-between align-items-start gap-2' },
+          UI.h('div', null,
+            UI.h('div', { class: 'gen-eyebrow' }, UI.h('span', { class: 'dot' }), 'Opportunity'),
+            UI.h('h3', { class: 'gen-title' }, 'Duyệt HĐ/PL (BMS + CM)')),
+          UI.h('span', { class: 'gen-class' }, 'registration.lookup + approve-bms + -cm')),
+        UI.h('p', { class: 'gen-signature' }, 'Tra Mã YC → tự tìm BGĐ phụ trách → duyệt BMS → duyệt CM'),
+        UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin-top: 4px;' },
+          'Chạy SAU KHI đã tạo yêu cầu đăng ký triển khai (HĐ/PL) bằng tay — tool này chỉ DUYỆT, không tạo.')),
+      UI.h('div', { class: 'gen-body' },
+        field('Mã YC', regCodeInput, 'mã đăng ký CM, vd CMR2614586'),
+        field('Tài khoản CM (duyệt CM)', cmInput, 'mặc định admin01'),
+        status),
+      UI.h('div', { class: 'gen-footer' }, button));
+  }
+
+  // Selenium logins are cookie-jar based here (not a single bearer token),
+  // so the cache stores the joined "name=value; ..." header string instead
+  // of a JWT. Same TTL reasoning as tokenCache/cmTokenCache above.
+  const ivoiceSessionCache = new Map(); // email -> { cookieHeader, fetchedAt }
+
+  async function getCachedOrFreshIvoiceSession(email) {
+    const cached = ivoiceSessionCache.get(email);
+    if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) {
+      return { cookieHeader: cached.cookieHeader, cached: true };
+    }
+    const resp = await api.generate('auth.get-ivoice-session', { username: email, password: DEFAULT_OTP_PASSWORD });
+    const cookieHeader = resp.result.data.cookieHeader;
+    ivoiceSessionCache.set(email, { cookieHeader, fetchedAt: Date.now() });
+    return { cookieHeader, cached: false };
+  }
+
+  // Legacy bms/RegistrationMagt_v12/* area — a SEPARATE cookie jar from
+  // ivoiceSessionCache above, confirmed live 2026-09-07: reusing the IVOICE
+  // jar against InsertRegistration got a real HTTP 401, and the 2 areas
+  // actively wipe each other's cookies within one browser session (user
+  // confirmed this matches real browser behavior, not a Selenium artifact —
+  // clicking BMS → IVOICE really does cross into a separate auth area). See
+  // GetBmsLegacySessionGenerator.java / memory/api-contracts.md.
+  // Cache key theo "email|refCode" (KHÔNG chỉ email) — user report 2026-09-07:
+  // 2 refCode khác nhau (CH00085443_96442, CH00085444_...) đều fail y hệt
+  // "không có quyền thao tác" dù RegistrationId thứ 2 hoàn toàn mới/sạch,
+  // và cả 2 lần log đều ghi "Dùng lại session... còn hạn" — tức cookie mint
+  // cho refCode ĐẦU TIÊN đang bị TÁI SỬ DỤNG cho refCode SAU, vì cache cũ
+  // chỉ khoá theo email. Nếu server gắn phiên FTIBMS-Auth với refCode cụ
+  // thể lúc mint (session server-side "đang sửa registration X"), dùng nó
+  // cho registration Y khác sẽ bị từ chối đúng như quan sát được — khớp
+  // hoàn hảo. Sửa: khoá cache theo cả refCode, luôn re-mint đúng session
+  // khi refCode đổi (chấp nhận chậm hơn ~12s mỗi refCode mới, nhưng đúng).
+  const bmsLegacySessionCache = new Map(); // "email|refCode" -> { cookieHeader, fetchedAt }
+
+  async function getCachedOrFreshBmsLegacySession(email, refCode) {
+    const cacheKey = email + '|' + refCode;
+    const cached = bmsLegacySessionCache.get(cacheKey);
+    if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) {
+      return { cookieHeader: cached.cookieHeader, cached: true };
+    }
+    const resp = await api.generate('auth.get-bms-legacy-session', { username: email, password: DEFAULT_OTP_PASSWORD, refCode });
+    const cookieHeader = resp.result.data.cookieHeader;
+    bmsLegacySessionCache.set(cacheKey, { cookieHeader, fetchedAt: Date.now() });
+    return { cookieHeader, cached: false };
+  }
+
+  /**
+   * "Ivoice — Tạo yêu cầu HĐ/PL" — MỘT form duy nhất (user request
+   * 2026-09-07: "bên dưới điền luôn trong 1 form luôn chứ vậy chi cho
+   * lằng nhằng" — trước đó tách 2 card riêng: "Xác định yêu cầu" (Tài
+   * khoản Sale/Mã cơ hội/Loại dịch vụ) + "Thêm chi tiết" (mọi thứ còn
+   * lại), giao tiếp qua 1 object `identity` với cơ chế `onChange`
+   * subscribe. Từ khi 2 card hành động cũ gộp thành 1 nút "Thêm chi tiết"
+   * duy nhất, việc tách riêng card định danh không còn cần thiết (không
+   * còn 2 card độc lập nào cần "dùng chung" nữa) — gộp thẳng vào đây,
+   * dùng biến cục bộ thay vì object/getter/subscribe.
+   *
+   * 1 nút "Thêm chi tiết" chạy tuần tự CẢ HAI lệnh gọi thật, theo ĐÚNG thứ
+   * tự đã xác nhận sống 2026-09-07 (xem walkthrough Chrome đầy đủ trong
+   * memory/api-contracts.md):
+   *   1. ivoice.create-registration-detail (POST InsertRegistrationIframe
+   *      — lưu chi tiết số điện thoại vào IVOICE, tương ứng nút "Thêm chi
+   *      tiết" trong Bước 2 "Thông tin dịch vụ")
+   *   2. bms.insert-registration (POST InsertRegistration — nút "Tạo" ở
+   *      Bước 3 "Xác Nhận Thông Tin" của legacy BMS, đẩy registration sang
+   *      "Chờ BGĐ duyệt")
+   * (Thứ tự BAN ĐẦU khi mới gộp 2 card hành động là ngược lại — đã sửa
+   * sau khi live test cho thấy bmsv2 chặn không cho qua Bước 3 nếu chưa có
+   * "Thông tin triển khai", tức bước IVOICE phải chạy trước.)
+   *
+   * Log hiển thị RAW RESPONSE của cả 2 bước — response thật của cả 2 API
+   * này lần đầu quan sát được là qua bài test sống 2026-09-07 (trước đó
+   * chỉ có request, vì "Copy as cURL" không chụp response).
+   *
+   * ListBillingContact/TechRegistrations là form thật (thêm/xoá dòng),
+   * không phải JSON thô — khớp đúng modal "Thêm liên hệ thu cước"/"Thêm
+   * liên hệ kỹ thuật" đã thao tác trên legacy BMS thật. ListDeployment
+   * KHÔNG có input riêng — tự build từ đúng field "chi tiết triển khai
+   * IVOICE" đã điền ở trên (không bắt nhập 2 lần). ListMember vẫn để JSON
+   * thô vì `RefibbmembersId` chưa rõ nguồn lấy tự động.
+   *
+   * Requires an EXISTING RegistrationId (the initial "Xác nhận tạo yêu cầu
+   * hợp đồng" click that mints one is still unreverse-engineered — see
+   * memory/api-contracts.md — mọi thứ ở đây chỉ TIẾP TỤC 1 registration đã
+   * tồn tại sẵn, chưa tự tạo mới từ đầu được).
+   */
+  function mountIvoiceCard() {
+    const field = (labelText, input, hint) => UI.h('label', { class: 'd-block' },
+      UI.h('div', { class: 'field-label' },
+        UI.h('span', { class: 'lbl' }, labelText),
+        hint ? UI.h('span', { class: 'hint' }, hint) : null),
+      input);
+
+    // serviceGroup/serviceType/typeDocContract + their display labels are
+    // the real values captured in the InsertRegistration payload for
+    // Điện thoại cố định (see memory/api-contracts.md) — confirmed live by
+    // the user 2026-09-07: chọn "Điện thoại cố định" thì Nhóm dịch vụ =
+    // "Đấu số thoại", Loại dịch vụ = "Điện thoại cố định", Loại văn bản =
+    // "Hợp đồng". The other 3 sub-loại have no captured payload yet, so
+    // stay unsupported.
+    const SERVICE_TYPES = [
+      {
+        value: 'phone', label: 'Điện thoại cố định', supported: true,
+        serviceGroup: '1', serviceGroupLabel: 'Đấu số thoại',
+        serviceType: '1',
+        typeDocContract: '1', typeDocContractLabel: 'Hợp đồng',
+      },
+      { value: '1800', label: '1800', supported: false },
+      { value: '1900', label: '1900', supported: false },
+      { value: 'cskh', label: 'CSKH', supported: false },
+    ];
+
+    const saleInput = UI.h('input', { class: 'app-input', type: 'text', placeholder: 'vd: sale01' });
+    const opportunityCodeInput = UI.h('input', { class: 'app-input', type: 'text', placeholder: 'CH00085410' });
+    const typeSelect = UI.h('select', { class: 'app-select' },
+      ...SERVICE_TYPES.map((t) => UI.h('option', { value: t.value }, t.label)));
+    // Disabled (user request 2026-09-07): purely auto-derived from Mã cơ
+    // hội via ivoice.lookup-opportunity — nothing to type by hand. Still
+    // settable programmatically (disabled only blocks USER edits, not JS
+    // assignment) so the auto-lookup handler below keeps working.
+    const customerIdInput = UI.h('input', { class: 'app-input', type: 'text', placeholder: 'FTI260739', disabled: true });
+    const refCodeInput = UI.h('input', { class: 'app-input', type: 'text', placeholder: 'CH00085410_96362', disabled: true });
+    const taxIdInput = UI.h('input', { class: 'app-input', type: 'text', placeholder: 'P37590260', disabled: true });
+    // RegistrationId never rendered (user request 2026-09-07: "cái này ko
+    // cần hiện") — kept as a detached input purely as an internal value
+    // holder, still readable/settable exactly like a normal field.
+    const registrationIdInput = UI.h('input', { type: 'hidden' });
+    const oppLookupStatus = UI.h('span', { class: 'hint' }, 'tự động lấy khi rời khỏi ô Mã cơ hội (cần điền Tài khoản Sale trước)');
+
+    function currentSaleEmail() { return toLoginEmail(saleInput.value.trim()); }
+    function currentServiceMeta() { return SERVICE_TYPES.find((t) => t.value === typeSelect.value); }
+    // Thay cho cơ chế identity.onChange(fn) trước đây (khi còn 2 card
+    // riêng, cần subscribe qua lại) — giờ mọi thứ cùng 1 scope nên gọi
+    // thẳng các hàm phụ thuộc (renderDerivedSummary/loadWards/searchPhones/
+    // renderBodyForType, khai báo bằng `function` nên đã hoisted, gọi được
+    // dù đứng trước phần định nghĩa của chúng trong file).
+    function onIdentityChange() {
+      renderDerivedSummary();
+      loadWards();
+      searchPhones();
+      renderBodyForType();
+      refreshListMemberDefault();
+    }
+
+    // Auto-derive RefCode + Mã số thuế KH + Mã KH + RegistrationId from Mã
+    // cơ hội (user request 2026-09-03: "bạn phải tự lấy được chứ" — don't
+    // make them type either by hand). Fires on blur (real input event
+    // 'change') rather than every keystroke. See
+    // LookupOpportunityForIvoiceGenerator.java for the 2-call chain this
+    // wraps.
+    opportunityCodeInput.addEventListener('change', async () => {
+      const saleEmail = currentSaleEmail();
+      const opportunityCode = opportunityCodeInput.value.trim();
+      if (!opportunityCode) return;
+      if (!saleEmail) {
+        oppLookupStatus.textContent = '✗ Điền Tài khoản Sale trước để tự động lấy';
+        oppLookupStatus.classList.add('is-error');
+        return;
+      }
+      oppLookupStatus.classList.remove('is-error');
+      oppLookupStatus.textContent = `⏳ Đang tra cứu ${opportunityCode}…`;
+      try {
+        const { token } = await getCachedOrFreshToken(saleEmail);
+        const resp = await api.generate('ivoice.lookup-opportunity', { bearerToken: token, opportunityCode });
+        const d = resp.result.data;
+        customerIdInput.value = d.customerId;
+        registrationIdInput.value = d.registrationId;
+        refCodeInput.value = d.refCode;
+        taxIdInput.value = d.taxId;
+        oppLookupStatus.textContent = `✓ RefCode=${d.refCode}, KH=${d.customerId}, Mã số thuế=${d.taxId}`;
+        onIdentityChange(); // customerId/refCode/taxId just got set programmatically — no native 'change' event fires for that, so trigger explicitly
+      } catch (err) {
+        oppLookupStatus.textContent = '✗ Tra cứu lỗi: ' + (err.message || err);
+        oppLookupStatus.classList.add('is-error');
+      }
+    });
+    saleInput.addEventListener('change', onIdentityChange);
+    typeSelect.addEventListener('change', onIdentityChange);
+
+    const derivedSummary = UI.h('div', { class: 'hint' }, '');
+    function renderDerivedSummary() {
+      const meta = currentServiceMeta();
+      if (!meta) { derivedSummary.textContent = ''; return; }
+      if (!meta.supported) {
+        derivedSummary.classList.add('is-error');
+        derivedSummary.textContent = `⚠️ "${meta.label}" chưa hỗ trợ — chưa capture được payload cho loại dịch vụ này.`;
+      } else {
+        derivedSummary.classList.remove('is-error');
+        derivedSummary.textContent = `Nhóm dịch vụ: ${meta.serviceGroupLabel} · Loại dịch vụ: ${meta.label} · Loại văn bản: ${meta.typeDocContractLabel}`;
+      }
+    }
+    renderDerivedSummary();
+
+    // ----- Bước 2/3 (BMS) — điều khoản hợp đồng -----
+    const typeContractCategoryInput = UI.h('input', { class: 'app-input', type: 'text', value: '1' });
+    // Dùng CHUNG 1 locationSelect cho cả Registration.Location (bước 2/3)
+    // lẫn locationId (IVOICE) — cùng 1 khái niệm Vùng miền/Tỉnh thành,
+    // cùng 1 id space (8=HCM, 4=HN) ở cả 2 hệ thống.
+    const locationSelect = UI.h('select', { class: 'app-select' },
+      UI.h('option', { value: '8' }, 'Thành phố Hồ Chí Minh'),
+      UI.h('option', { value: '4' }, 'Thành phố Hà Nội'));
+    const locationNameHidden = { get value() { return locationSelect.selectedOptions[0].textContent; } };
+    const paymentMethodInput = UI.h('input', { class: 'app-input', type: 'text', value: '2' });
+    const limitCreditDayInput = UI.h('input', { class: 'app-input', type: 'text', value: '30' });
+    const feeContractInput = UI.h('input', { class: 'app-input', type: 'text', value: '0' });
+    const monthlyFeeContractInput = UI.h('input', { class: 'app-input', type: 'text', value: '10' });
+    const dateContractMonthInput = UI.h('input', { class: 'app-input', type: 'text', value: '1' });
+    const contractValueInput = UI.h('input', { class: 'app-input', type: 'text', value: '0' });
+    const notesInput = UI.h('textarea', { class: 'app-input', rows: 3, value: '' });
+    const descriptionInput = UI.h('textarea', { class: 'app-input', rows: 3, value: '' });
+
+    // ----- Phường/Xã (IVOICE) — real dropdown, populated by ivoice.get-ward -----
+    const wardSelect = UI.h('select', { class: 'app-select' },
+      UI.h('option', { value: '' }, 'Điền Tài khoản Sale để tự tải danh sách'));
+    const wardIdHidden = { get value() { return wardSelect.value; } };
+    const wardNameHidden = { get value() { return wardSelect.selectedOptions[0] ? wardSelect.selectedOptions[0].textContent : ''; } };
+    const wardStatus = UI.h('span', { class: 'hint' }, '');
+    // Cached alongside wardSelect's own options so the Liên hệ thu cước rows
+    // below (mỗi dòng có Phường/Xã riêng) can reuse the SAME already-fetched
+    // list instead of calling ivoice.get-ward again per row — confirmed live
+    // 2026-09-07 that this ward-id space is the same one legacy BMS's
+    // ListBillingContact/ListDeployment `District` field expects (see
+    // memory/api-contracts.md quirk note).
+    let currentWards = [];
+    function buildWardOptions() {
+      if (currentWards.length === 0) {
+        return [UI.h('option', { value: '' }, 'Chưa có — tải Phường/Xã ở trên trước')];
+      }
+      return currentWards.map((w) => UI.h('option', { value: String(w.id) }, w.name));
+    }
+    async function loadWards() {
+      const saleEmail = currentSaleEmail();
+      if (!saleEmail) return;
+      wardStatus.textContent = 'Đang tải Phường/Xã…';
+      wardStatus.classList.remove('is-error');
+      try {
+        const { cookieHeader } = await getCachedOrFreshIvoiceSession(saleEmail);
+        const resp = await api.generate('ivoice.get-ward', { cookieHeader, locationId: locationSelect.value });
+        const wards = resp.result.data.wards || [];
+        currentWards = wards;
+        wardSelect.innerHTML = '';
+        wards.forEach((w) => wardSelect.appendChild(UI.h('option', { value: String(w.id) }, w.name)));
+        if (wards.length > 0) wardSelect.value = String(wards[0].id);
+        wardStatus.textContent = `✓ ${wards.length} Phường/Xã (mặc định: ${wards[0] ? wards[0].name : '(không có)'})`;
+      } catch (err) {
+        wardStatus.textContent = '✗ Tải Phường/Xã lỗi: ' + (err.message || err);
+        wardStatus.classList.add('is-error');
+      }
+    }
+    const loadWardsButton = UI.h('button', {
+      type: 'button', class: 'btn-generate',
+      style: 'margin-top: 6px; padding: 6px 14px; font-size: 12px; width: auto;',
+      onclick: async () => {
+        if (!currentSaleEmail()) { UI.toast('error', 'Điền Tài khoản Sale trước'); return; }
+        loadWardsButton.disabled = true;
+        try { await loadWards(); } finally { loadWardsButton.disabled = false; }
+      },
+    }, 'Tải lại Phường/Xã');
+    locationSelect.addEventListener('change', () => {
+      wardSelect.innerHTML = '';
+      wardSelect.appendChild(UI.h('option', { value: '' }, 'Điền Tài khoản Sale để tự tải danh sách'));
+      loadWards();
+    });
+
+    // ----- chi tiết triển khai IVOICE — random-filled -----
+    const locationNumberInput = UI.h('input', { class: 'app-input', type: 'text', value: randHouseNumber() });
+    const randContactName = randVnName();
+    const contactNameInput = UI.h('input', { class: 'app-input', type: 'text', value: randContactName });
+    const contactPhoneInput = UI.h('input', { class: 'app-input', type: 'text', value: randVnPhone() });
+    const contactEmailInput = UI.h('input', { class: 'app-input', type: 'email', value: randEmail(randContactName) });
+    const deployDateInput = UI.h('input', { class: 'app-input', type: 'text', value: todayMMDDYYYY() });
+    const autoCallSelect = UI.h('select', { class: 'app-select' },
+      UI.h('option', { value: '0' }, 'Không'),
+      UI.h('option', { value: '1' }, 'Có'));
+    const ipMainInput = UI.h('input', { class: 'app-input', type: 'text', value: randIp() });
+    const platformSelect = UI.h('select', { class: 'app-select' },
+      UI.h('option', { value: '1' }, 'Thường'),
+      UI.h('option', { value: '2' }, 'Voice Brandname'));
+
+    let availablePhones = [];
+    const selectedPhoneIds = new Set();
+    const phoneListBody = UI.h('div', { class: 'phone-list-body' },
+      UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin: 0;' }, 'Điền Tài khoản Sale + Mã số thuế KH để tự tìm số.'));
+    const phoneStatus = UI.h('span', { class: 'hint' }, '');
+
+    async function searchPhones() {
+      const saleEmail = currentSaleEmail();
+      const taxId = taxIdInput.value.trim();
+      if (!saleEmail || !taxId) return;
+      phoneStatus.textContent = 'Đang tìm số điện thoại…';
+      phoneStatus.classList.remove('is-error');
+      try {
+        const { cookieHeader } = await getCachedOrFreshIvoiceSession(saleEmail);
+        const resp = await api.generate('ivoice.get-phone-booked', {
+          cookieHeader, locationId: locationSelect.value, taxId, voiceBrandName: platformSelect.value,
+        });
+        availablePhones = resp.result.data.phones || [];
+        selectedPhoneIds.clear();
+        renderPhoneList();
+        phoneStatus.textContent = `✓ Tìm thấy ${availablePhones.length} số điện thoại`;
+      } catch (err) {
+        phoneStatus.textContent = '✗ Tìm số điện thoại lỗi: ' + (err.message || err);
+        phoneStatus.classList.add('is-error');
+      }
+    }
+    locationSelect.addEventListener('change', searchPhones);
+    platformSelect.addEventListener('change', searchPhones);
+
+    function renderPhoneList() {
+      phoneListBody.innerHTML = '';
+      if (availablePhones.length === 0) {
+        phoneListBody.appendChild(UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin: 0;' },
+          'Không có số nào khả dụng cho Tỉnh thành/Nền tảng đã chọn.'));
+        return;
+      }
+      availablePhones.forEach((row) => {
+        const id = row.id;
+        const checkbox = UI.h('input', {
+          type: 'checkbox',
+          onchange: (e) => { if (e.target.checked) selectedPhoneIds.add(id); else selectedPhoneIds.delete(id); },
+        });
+        const priceText = (row.subcriberCharge != null) ? `${row.subcriberCharge.toLocaleString('vi-VN')}đ/tháng` : '';
+        phoneListBody.appendChild(UI.h('label', { class: 'd-flex align-items-center gap-2', style: 'padding: 3px 0;' },
+          checkbox,
+          UI.h('span', { class: 'mono' }, row.phoneNumber || '(?)'),
+          UI.h('span', { class: 'hint' }, priceText)));
+      });
+    }
+
+    // ----- Bước 2/3 (BMS) — ListMember vẫn để JSON thô (RefibbmembersId chưa
+    // rõ nguồn lấy tự động, không có picker) -----
+    function defaultListMemberJson() {
+      return JSON.stringify([{
+        Name: currentSaleEmail() ? currentSaleEmail().split('@')[0] : 'sale01', Position: 1, ContractRate: 100,
+        RefibbmembersId: '1000772803', OpportunityId: opportunityCodeInput.value.trim() || 'CH00085412',
+      }], null, 2);
+    }
+    const listMemberJsonInput = UI.h('textarea', {
+      class: 'app-input', rows: 4, style: 'font-family: monospace; font-size: 12px;',
+      value: defaultListMemberJson(),
+    });
+    // ❌ Bug thật 2026-09-07: giá trị trên chỉ tính 1 LẦN lúc mount (Mã cơ
+    // hội lúc đó còn trống → luôn fallback về "CH00085412" hardcode) —
+    // KHÔNG tự cập nhật khi người dùng gõ Mã cơ hội thật sau đó, dẫn tới
+    // `ListMember[].OpportunityId` LỆCH với `OpportunityId` top-level của
+    // jsonData (VD gửi CH00085443 nhưng ListMember vẫn ghi CH00085412) —
+    // server coi là dữ liệu không nhất quán, từ chối với message chung
+    // chung "không có quyền/đã hoàn thành". Fix: tự refresh lại mỗi khi
+    // Mã cơ hội/Tài khoản Sale đổi, TRỪ KHI người dùng đã tự tay sửa ô
+    // này (tránh ghi đè chỉnh sửa thật, ví dụ RefibbmembersId đúng).
+    let listMemberEditedByUser = false;
+    listMemberJsonInput.addEventListener('input', () => { listMemberEditedByUser = true; });
+    function refreshListMemberDefault() {
+      if (!listMemberEditedByUser) listMemberJsonInput.value = defaultListMemberJson();
+    }
+
+    // ----- Liên hệ thu cước (ListBillingContact) — real form rows, thay
+    // JSON thô, khớp đúng modal "Thêm liên hệ thu cước" đã thao tác thật
+    // trên legacy BMS 2026-09-07. Rỗng mặc định (giống UI thật "Không có
+    // dữ liệu!" cho tới khi bấm "+ Thêm") — bắt buộc >= 1 dòng khi submit.
+    const billingContacts = [];
+    const billingListBody = UI.h('div', null,
+      UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin: 0;' }, 'Chưa có liên hệ thu cước nào — bấm "+ Thêm" bên dưới.'));
+    function renderBillingEmpty() {
+      if (billingContacts.length === 0) {
+        billingListBody.innerHTML = '';
+        billingListBody.appendChild(UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin: 0;' }, 'Chưa có liên hệ thu cước nào — bấm "+ Thêm" bên dưới.'));
+      }
+    }
+    function addBillingRow() {
+      if (billingContacts.length === 0) billingListBody.innerHTML = '';
+      const name = randVnName();
+      const nameInput = UI.h('input', { class: 'app-input', type: 'text', value: name });
+      const phoneInput = UI.h('input', { class: 'app-input', type: 'text', value: randVnPhone() });
+      const emailInput = UI.h('input', { class: 'app-input', type: 'email', value: randEmail(name) });
+      const addressInput = UI.h('input', { class: 'app-input', type: 'text', value: randHouseNumber() });
+      const wardSel = UI.h('select', { class: 'app-select' }, ...buildWardOptions());
+      const rowEl = UI.h('div', { class: 'field-grid-3', style: 'align-items: end; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--ink-700);' },
+        field('Người liên hệ', nameInput),
+        field('SĐT', phoneInput),
+        field('Email', emailInput),
+        field('Số nhà, tên đường', addressInput),
+        field('Phường/Xã', wardSel, 'theo Vùng miền hiện tại'),
+        UI.h('button', {
+          type: 'button', class: 'btn-generate', style: 'padding: 6px 14px; font-size: 12px; width: auto;',
+          onclick: () => {
+            rowEl.remove();
+            const idx = billingContacts.indexOf(entry);
+            if (idx >= 0) billingContacts.splice(idx, 1);
+            renderBillingEmpty();
+          },
+        }, 'Xoá'));
+      const entry = { nameInput, phoneInput, emailInput, addressInput, wardSel, rowEl };
+      billingContacts.push(entry);
+      billingListBody.appendChild(rowEl);
+    }
+    const addBillingButton = UI.h('button', {
+      type: 'button', class: 'btn-generate', style: 'padding: 6px 14px; font-size: 12px; width: auto; margin-top: 6px;',
+      onclick: () => addBillingRow(),
+    }, '+ Thêm liên hệ thu cước');
+
+    // ----- Liên hệ kỹ thuật (TechRegistrations) — real form rows, đơn
+    // giản hơn (không có địa chỉ). -----
+    const techContacts = [];
+    const techListBody = UI.h('div', null,
+      UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin: 0;' }, 'Chưa có liên hệ kỹ thuật nào — bấm "+ Thêm" bên dưới.'));
+    function renderTechEmpty() {
+      if (techContacts.length === 0) {
+        techListBody.innerHTML = '';
+        techListBody.appendChild(UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin: 0;' }, 'Chưa có liên hệ kỹ thuật nào — bấm "+ Thêm" bên dưới.'));
+      }
+    }
+    function addTechRow() {
+      if (techContacts.length === 0) techListBody.innerHTML = '';
+      const name = randVnName();
+      const nameInput = UI.h('input', { class: 'app-input', type: 'text', value: name });
+      const phoneInput = UI.h('input', { class: 'app-input', type: 'text', value: randVnPhone() });
+      const emailInput = UI.h('input', { class: 'app-input', type: 'email', value: randEmail(name) });
+      const rowEl = UI.h('div', { class: 'field-grid-3', style: 'align-items: end; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--ink-700);' },
+        field('Người liên hệ', nameInput),
+        field('SĐT', phoneInput),
+        field('Email', emailInput),
+        UI.h('button', {
+          type: 'button', class: 'btn-generate', style: 'padding: 6px 14px; font-size: 12px; width: auto;',
+          onclick: () => {
+            rowEl.remove();
+            const idx = techContacts.indexOf(entry);
+            if (idx >= 0) techContacts.splice(idx, 1);
+            renderTechEmpty();
+          },
+        }, 'Xoá'));
+      const entry = { nameInput, phoneInput, emailInput, rowEl };
+      techContacts.push(entry);
+      techListBody.appendChild(rowEl);
+    }
+    const addTechButton = UI.h('button', {
+      type: 'button', class: 'btn-generate', style: 'padding: 6px 14px; font-size: 12px; width: auto; margin-top: 6px;',
+      onclick: () => addTechRow(),
+    }, '+ Thêm liên hệ kỹ thuật');
+
+    // ----- Duyệt BGĐ + CM tự động sau khi Tạo (user request 2026-09-07:
+    // "thêm bước BGĐ duyệt và cm duyệt vô luôn khi người dùng tick đi") —
+    // tick mới chạy, mặc định TẮT vì đây là hành động phê duyệt thật, có
+    // tác động ngoài (đẩy hợp đồng/PL thật). Tái dùng ĐÚNG chain đã chạy ở
+    // card "Duyệt HĐ/PL (BMS + CM)" (registration.lookup → approve-bms →
+    // approve-cm) — registration.lookup's `regCode` param tự fallback
+    // sang match opportunityId khi chưa có Mã YC thật (đăng ký vừa tạo),
+    // nên dùng thẳng opportunityCode làm keyword tra cứu, không cần chờ
+    // response Tạo trả về Mã YC (chưa quan sát được response thành công
+    // thật của InsertRegistration để biết field đó tên gì).
+    const autoApproveCheckbox = UI.h('input', { type: 'checkbox' });
+    const cmApproverInput = UI.h('input', { class: 'app-input', type: 'text', value: 'admin01', style: 'max-width: 200px; display: inline-block;' });
+
+    const status = UI.h('div', { class: 'autoflow-status' });
+    const addLine = () => {
+      const line = UI.h('div', { class: 'autoflow-line' }, '');
+      status.appendChild(line);
+      return line;
+    };
+
+    async function runAutoApprove(opportunityCode) {
+      const lookupLine = addLine();
+      lookupLine.textContent = `⏳ Đang tra Mã YC cho ${opportunityCode}…`;
+      let opportunityId, bgdUsername;
+      try {
+        const { token } = await getCachedOrFreshToken(HDPL_LOOKUP_EMAIL);
+        const resp = await api.generate('registration.lookup', { bearerToken: token, regCode: opportunityCode });
+        const d = resp.result.data;
+        opportunityId = d.opportunityId;
+        bgdUsername = d.bgdUsername;
+        lookupLine.textContent = `✓ Tìm thấy ${opportunityId} — BGĐ phụ trách: ${bgdUsername}` + (d.alreadyApproved ? ' (đã duyệt BMS từ trước)' : '');
+      } catch (err) {
+        lookupLine.textContent = '✗ Tra Mã YC lỗi: ' + (err.message || err);
+        lookupLine.classList.add('is-error');
+        return;
+      }
+
+      const bgdEmail = toLoginEmail(bgdUsername);
+      const bmsLine = addLine();
+      bmsLine.textContent = `⏳ Đăng nhập BGĐ (${bgdEmail})…`;
+      let bgdToken;
+      try {
+        const { token, cached } = await getCachedOrFreshToken(bgdEmail);
+        bgdToken = token;
+        bmsLine.textContent = cached ? `✓ Dùng lại token BGĐ (${bgdEmail}, còn hạn)` : `✓ Đăng nhập BGĐ thành công (${bgdEmail})`;
+      } catch (err) {
+        bmsLine.textContent = '✗ Đăng nhập BGĐ lỗi: ' + (err.message || err);
+        bmsLine.classList.add('is-error');
+        return;
+      }
+
+      let regCodes = [];
+      const approveLine = addLine();
+      approveLine.textContent = '⏳ Đang duyệt HĐ/PL bên BMS…';
+      try {
+        const resp = await api.generate('registration.approve-bms', { bearerToken: bgdToken, opportunityId });
+        regCodes = resp.result.data.regCodes || [];
+        approveLine.textContent = `✓ BMS duyệt xong (${resp.result.data.registrations.length} registration)`;
+      } catch (err) {
+        approveLine.textContent = '✗ Duyệt BMS lỗi: ' + (err.message || err);
+        approveLine.classList.add('is-error');
+        return;
+      }
+
+      if (regCodes.length === 0) {
+        const line = addLine();
+        line.textContent = '⚠ Không tìm được Mã YC (regCode) nào để duyệt tiếp CM — dừng ở đây';
+        line.classList.add('is-error');
+        return;
+      }
+
+      const cmEmail = toLoginEmail(cmApproverInput.value.trim());
+      const cmLoginLine = addLine();
+      cmLoginLine.textContent = `⏳ Đăng nhập CM (${cmEmail})…`;
+      let cmToken;
+      try {
+        const { token, cached } = await getCachedOrFreshCmToken(cmEmail);
+        cmToken = token;
+        cmLoginLine.textContent = cached ? `✓ Dùng lại token CM (${cmEmail}, còn hạn)` : `✓ Đăng nhập CM thành công (${cmEmail})`;
+      } catch (err) {
+        cmLoginLine.textContent = '✗ Đăng nhập CM lỗi: ' + (err.message || err);
+        cmLoginLine.classList.add('is-error');
+        return;
+      }
+
+      for (const regCode of regCodes) {
+        const line = addLine();
+        line.textContent = `⏳ Đang duyệt CM cho ${regCode}…`;
+        try {
+          const resp = await api.generate('registration.approve-cm', { cmToken, regCode });
+          const d = resp.result.data;
+          line.textContent = d.skipped
+            ? `✓ ${regCode} đã hoàn thành từ trước (hợp đồng ${d.contractNo || '?'})`
+            : `✓ ${regCode} duyệt CM xong — hợp đồng ${d.contractNo || '?'} / PL ${d.subContractNo || '?'}`;
+        } catch (err) {
+          line.textContent = `✗ Duyệt CM lỗi cho ${regCode}: ` + (err.message || err);
+          line.classList.add('is-error');
+        }
+      }
+    }
+
+    function parseJsonArrayField(name, input, line) {
+      const raw = input.value.trim();
+      try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) throw new Error('không phải array');
+        return raw;
+      } catch (err) {
+        line.textContent = `✗ ${name} không phải JSON array hợp lệ: ` + (err.message || err);
+        line.classList.add('is-error');
+        return null;
+      }
+    }
+
+    const phoneFormBody = UI.h('div', { class: 'gen-body' },
+      UI.h('div', { class: 'field-grid-3' },
+        field('Phân loại hợp đồng (TypeContract)', typeContractCategoryInput),
+        field('Vùng miền / Tỉnh thành', locationSelect, '8 = HCM, 4 = HN — dùng chung cho cả 2 bước'),
+        field('Hình thức thanh toán', paymentMethodInput),
+        field('Hạn mức công nợ (ngày)', limitCreditDayInput),
+        field('Cước trả một lần', feeContractInput),
+        field('Cước tháng', monthlyFeeContractInput),
+        field('Kỳ hạn thanh toán (tháng)', dateContractMonthInput),
+        field('Giá trị HĐ/PL', contractValueInput)),
+      UI.h('div', { class: 'field-grid' },
+        field('Ghi chú', notesInput),
+        field('Mô tả', descriptionInput)),
+      UI.h('div', { class: 'field-grid-3' },
+        UI.h('label', { class: 'd-block' },
+          UI.h('div', { class: 'field-label' }, UI.h('span', { class: 'lbl' }, 'Phường/Xã')),
+          wardSelect,
+          UI.h('div', { style: 'margin-top: 6px;' }, loadWardsButton, ' ', wardStatus)),
+        field('Số nhà, tên đường', locationNumberInput),
+        field('Người liên hệ', contactNameInput),
+        field('Điện thoại liên hệ', contactPhoneInput),
+        field('Email liên hệ', contactEmailInput),
+        field('Ngày hẹn triển khai', deployDateInput),
+        field('Auto Call', autoCallSelect),
+        field('IP kết nối', ipMainInput),
+        field('Nền tảng', platformSelect, 'đổi lại sẽ search số điện thoại theo nền tảng đó')),
+      UI.h('label', { class: 'd-block' },
+        UI.h('div', { class: 'field-label' }, UI.h('span', { class: 'lbl' }, 'Số điện thoại'), phoneStatus),
+        UI.h('div', { style: 'margin-top: 8px;' }, phoneListBody)),
+      field('ListMember (JSON)', listMemberJsonInput, 'RefibbmembersId chưa rõ nguồn lấy — sửa tay theo Sale thật'),
+      UI.h('label', { class: 'd-block' },
+        UI.h('div', { class: 'field-label' }, UI.h('span', { class: 'lbl' }, 'Liên hệ thu cước')),
+        UI.h('div', { style: 'margin-top: 6px;' }, billingListBody, addBillingButton)),
+      UI.h('label', { class: 'd-block' },
+        UI.h('div', { class: 'field-label' }, UI.h('span', { class: 'lbl' }, 'Liên hệ kỹ thuật')),
+        UI.h('div', { style: 'margin-top: 6px;' }, techListBody, addTechButton)),
+      UI.h('label', { class: 'd-flex align-items-center gap-2', style: 'padding: 10px 0; border-top: 1px solid var(--ink-700); margin-top: 6px;' },
+        autoApproveCheckbox,
+        UI.h('span', { class: 'lbl' }, 'Tự động duyệt BGĐ + CM ngay sau khi Tạo thành công'),
+        UI.h('span', { class: 'hint' }, '— hành động phê duyệt thật, mặc định tắt'),
+        UI.h('span', null, 'Tài khoản CM duyệt:'),
+        cmApproverInput),
+      status);
+
+    const unsupportedBody = UI.h('div', { class: 'gen-body' },
+      UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300);' },
+        'Chưa hỗ trợ — chưa capture được payload cho loại dịch vụ này. Cần 1 lần "Copy as cURL" thật khi bấm Lưu trên UI (giống cách làm với Điện thoại cố định) để build tiếp.'));
+
+    const submitButton = UI.h('button', {
+      class: 'btn-generate',
+      type: 'button',
+      onclick: async () => {
+        status.innerHTML = '';
+        const saleEmail = currentSaleEmail();
+        const opportunityCode = opportunityCodeInput.value.trim();
+        const customerId = customerIdInput.value.trim();
+        const registrationId = registrationIdInput.value.trim();
+        const refCode = refCodeInput.value.trim();
+        const taxId = taxIdInput.value.trim();
+        const meta = currentServiceMeta();
+        if (!saleEmail || !opportunityCode || !customerId || !registrationId) {
+          const line = addLine();
+          line.textContent = '✗ Điền đủ Tài khoản Sale + Mã cơ hội ở trên (đợi tự tra cứu xong để có Mã KH/RefCode)';
+          line.classList.add('is-error');
+          return;
+        }
+        if (!meta || !meta.supported) {
+          const line = addLine();
+          line.textContent = `✗ Loại dịch vụ "${meta ? meta.label : '?'}" chưa hỗ trợ`;
+          line.classList.add('is-error');
+          return;
+        }
+        if (!wardSelect.value) {
+          const line = addLine();
+          line.textContent = '✗ Chưa chọn Phường/Xã — đợi danh sách tự tải xong rồi chọn 1 trong dropdown';
+          line.classList.add('is-error');
+          return;
+        }
+        const chosenPhones = availablePhones.filter((row) => selectedPhoneIds.has(row.id));
+        if (chosenPhones.length === 0) {
+          const line = addLine();
+          line.textContent = '✗ Chưa chọn số điện thoại nào — đợi danh sách tự tìm xong rồi tick ít nhất 1 số';
+          line.classList.add('is-error');
+          return;
+        }
+        if (billingContacts.length === 0) {
+          const line = addLine();
+          line.textContent = '✗ Chưa có Liên hệ thu cước — bấm "+ Thêm liên hệ thu cước" (bắt buộc, khớp form BMS thật)';
+          line.classList.add('is-error');
+          return;
+        }
+        if (techContacts.length === 0) {
+          const line = addLine();
+          line.textContent = '✗ Chưa có Liên hệ kỹ thuật — bấm "+ Thêm liên hệ kỹ thuật" (bắt buộc, khớp form BMS thật)';
+          line.classList.add('is-error');
+          return;
+        }
+        const validateLine = addLine();
+        const listMemberJson = parseJsonArrayField('ListMember', listMemberJsonInput, validateLine);
+        if (!listMemberJson) return;
+
+        // ListBillingContact — xây từ các dòng form thật (không còn JSON thô).
+        const listBillingContactJson = JSON.stringify(billingContacts.map(({ nameInput, phoneInput, emailInput, addressInput, wardSel }) => {
+          const wardName = wardSel.selectedOptions[0] ? wardSel.selectedOptions[0].textContent : '';
+          const address = addressInput.value.trim();
+          return {
+            Id: 0, ContactName: nameInput.value.trim(), ContactEmail: emailInput.value.trim(), ContactPhone: phoneInput.value.trim(),
+            Address: address, Location: Number(locationSelect.value), District: Number(wardSel.value || 0), Ward: 0,
+            Country: 'Việt Nam', FullAddress: `${address}, ${wardName}, ${locationNameHidden.value}, Việt Nam`,
+          };
+        }));
+        // TechRegistrations — xây từ các dòng form thật.
+        const techRegistrationsJson = JSON.stringify(techContacts.map(({ nameInput, phoneInput, emailInput }) => ({
+          Id: 0, techContact: nameInput.value.trim(), techEmail: emailInput.value.trim(), techNumber: phoneInput.value.trim(),
+        })));
+        // ListDeployment — tự lấy từ đúng field "chi tiết triển khai IVOICE"
+        // đã điền ở trên (Số nhà/Người liên hệ/Điện thoại/Email/Phường/Xã) —
+        // không cần nhập lại lần 2, khớp quirk đã xác nhận sống 2026-09-07:
+        // Location/District dùng CHUNG ward-id space với IVOICE.
+        const deployAddress = locationNumberInput.value.trim();
+        const listDeploymentJson = JSON.stringify([{
+          ContactName: contactNameInput.value.trim(), ContactEmail: contactEmailInput.value.trim(), ContactPhone: contactPhoneInput.value.trim(),
+          Address: deployAddress, Location: Number(locationSelect.value), District: Number(wardIdHidden.value || 0), Ward: 0, Country: '',
+          FullAddress: `${deployAddress}, ${wardNameHidden.value}, ${locationNameHidden.value}`,
+          Id: 0, refCodeOfIntegrated: 'null', IsSelected: true,
+        }]);
+        validateLine.textContent = '✓ ListMember hợp lệ · ' + billingContacts.length + ' liên hệ thu cước · ' + techContacts.length + ' liên hệ kỹ thuật';
+
+        submitButton.disabled = true;
+        try {
+          // 2 cookie jar RIÊNG BIỆT (confirmed live 2026-09-07 — xem javadoc
+          // GetBmsLegacySessionGenerator) — bms.insert-registration cần
+          // vùng legacy BMS, ivoice.create-registration-detail cần vùng
+          // IVOICE, dùng chung 1 jar sẽ bị 401 hoặc bị ghi đè lẫn nhau.
+          //
+          // THỨ TỰ ĐÃ ĐẢO LẠI (confirmed live 2026-09-07, xem walkthrough
+          // đầy đủ trong memory/api-contracts.md): thực tế IVOICE
+          // (InsertRegistrationIframe, "Thêm chi tiết") chạy TRƯỚC, rồi mới
+          // đến BMS legacy (InsertRegistration, nút "Tạo" ở Bước 3) — bmsv2
+          // còn CHẶN không cho qua Bước 3 nếu chưa có "Thông tin triển khai"
+          // (tức chưa làm bước IVOICE), nên thứ tự cũ (BMS trước) là SAI so
+          // với luồng thật.
+          const ivoiceLoginLine = addLine();
+          ivoiceLoginLine.textContent = `⏳ Đăng nhập IVOICE (${saleEmail})…`;
+          let ivoiceCookieHeader;
+          try {
+            const c = await getCachedOrFreshIvoiceSession(saleEmail);
+            ivoiceCookieHeader = c.cookieHeader;
+            ivoiceLoginLine.textContent = c.cached
+              ? `✓ Dùng lại session IVOICE (${saleEmail}, còn hạn)`
+              : `✓ Đăng nhập IVOICE thành công (${saleEmail})`;
+          } catch (err) {
+            ivoiceLoginLine.textContent = '✗ Đăng nhập IVOICE lỗi: ' + (err.message || err);
+            ivoiceLoginLine.classList.add('is-error');
+            return;
+          }
+
+          // ----- Bước 1/2: ivoice.create-registration-detail (Thêm chi tiết) -----
+          const step1Line = addLine();
+          step1Line.textContent = `⏳ [1/3] Đang tạo phiếu triển khai (Thêm chi tiết) cho ${refCode}…`;
+          let step1Ok = false;
+          try {
+            const resp = await api.generate('ivoice.create-registration-detail', {
+              cookieHeader: ivoiceCookieHeader,
+              refCode,
+              opportunityCode,
+              taxId,
+              locationId: locationSelect.value,
+              locationName: locationNameHidden.value,
+              wardId: wardIdHidden.value,
+              wardName: wardNameHidden.value,
+              locationNumber: locationNumberInput.value.trim(),
+              contactName: contactNameInput.value.trim(),
+              contactPhone: contactPhoneInput.value.trim(),
+              contactEmail: contactEmailInput.value.trim(),
+              deployDate: deployDateInput.value.trim(),
+              autoCall: autoCallSelect.value,
+              ipMain: ipMainInput.value.trim(),
+              platform: platformSelect.value,
+              phonesJson: JSON.stringify(chosenPhones),
+            });
+            const response = resp.result.data.response;
+            if (looksLikeFailureResponse(response)) {
+              // Server trả HTTP 200 nhưng body là lỗi nghiệp vụ (VD: RefCode
+              // này đã có phiếu triển khai / đã submit rồi) — user report
+              // 2026-09-07: UI từng hiện nhầm ✓ cho case này vì chỉ check
+              // HTTP status, không đọc field code/status bên trong response.
+              step1Line.textContent = `✗ [1/3] Thêm chi tiết THẤT BẠI (server trả lỗi nghiệp vụ, không phải lỗi mạng) — ${responseFailureMessage(response)} — response: ${JSON.stringify(response)}`;
+              step1Line.classList.add('is-error');
+              UI.toast('error', 'Thêm chi tiết thất bại: ' + responseFailureMessage(response));
+            } else {
+              step1Line.textContent = `✓ [1/3] Thêm chi tiết xong — response: ${JSON.stringify(response)}`;
+              step1Ok = true;
+            }
+          } catch (err) {
+            step1Line.textContent = '✗ [1/3] Thêm chi tiết lỗi: ' + (err.message || err);
+            step1Line.classList.add('is-error');
+            UI.toast('error', 'Thêm chi tiết lỗi: ' + (err.message || err));
+          }
+          if (!step1Ok) return;
+
+          // ----- Bước 2/2: bms.insert-registration (Bước 3 "Tạo", legacy BMS) -----
+          // Cần đăng nhập LẠI (vùng legacy BMS riêng — session bước 1 ở
+          // trên KHÔNG dùng chung được, xem javadoc GetBmsLegacySessionGenerator).
+          const loginLine = addLine();
+          loginLine.textContent = `⏳ Đăng nhập BMS legacy (${saleEmail})…`;
+          let bearerToken, bmsCookieHeader;
+          try {
+            const t = await getCachedOrFreshToken(saleEmail);
+            bearerToken = t.token;
+            const c = await getCachedOrFreshBmsLegacySession(saleEmail, refCode);
+            bmsCookieHeader = c.cookieHeader;
+            loginLine.textContent = c.cached
+              ? `✓ Dùng lại session BMS legacy (${saleEmail}, còn hạn)`
+              : `✓ Đăng nhập BMS legacy thành công (${saleEmail})`;
+          } catch (err) {
+            loginLine.textContent = '✗ Đăng nhập BMS legacy lỗi: ' + (err.message || err);
+            loginLine.classList.add('is-error');
+            return;
+          }
+          // ----- Bước 2/3: bms.check-service-integrate (pre-check mới phát
+          // hiện 2026-09-07, gọi ngay trước "Tạo" trong luồng thật — chưa
+          // rõ có bắt buộc hay không, nhưng mọi lần gọi thẳng
+          // InsertRegistration bỏ qua bước này đều bị "không có quyền",
+          // nên thử gọi nó trước xem có giải quyết được không). Không chặn
+          // luồng nếu bước này lỗi — chỉ log lại, vì chưa chắc chắn 100%
+          // là bắt buộc.
+          const checkLine = addLine();
+          checkLine.textContent = `⏳ [2/3] Đang gọi CheckServiceIntergrate cho ${refCode}…`;
+          try {
+            const refKeysJson = JSON.stringify(JSON.parse(listDeploymentJson).map((d) => d.refCodeOfIntegrated));
+            const checkResp = await api.generate('bms.check-service-integrate', {
+              cookieHeader: bmsCookieHeader,
+              refCode,
+              serviceGroup: meta.serviceGroup,
+              serviceType: meta.serviceType,
+              totalAmt: contractValueInput.value.trim(),
+              paymentTypeCode: paymentMethodInput.value.trim(),
+              refKeysJson,
+            });
+            const checkResponse = checkResp.result.data.response;
+            checkLine.textContent = `${looksLikeFailureResponse(checkResponse) ? '✗' : '✓'} [2/3] CheckServiceIntergrate xong — response: ${JSON.stringify(checkResponse)}`;
+            if (looksLikeFailureResponse(checkResponse)) checkLine.classList.add('is-error');
+          } catch (err) {
+            checkLine.textContent = '✗ [2/3] CheckServiceIntergrate lỗi (bỏ qua, vẫn thử Tạo tiếp): ' + (err.message || err);
+            checkLine.classList.add('is-error');
+          }
+
+          const step2Line = addLine();
+          step2Line.textContent = `⏳ [3/3] Đang gọi InsertRegistration (Bước 3 "Tạo") cho ${refCode}…`;
+          try {
+            const resp = await api.generate('bms.insert-registration', {
+              cookieHeader: bmsCookieHeader, bearerToken,
+              opportunityCode, registrationId, customerId,
+              serviceGroup: meta.serviceGroup,
+              serviceType: meta.serviceType,
+              typeContract: meta.typeDocContract,
+              typeContractCategory: typeContractCategoryInput.value.trim(),
+              location: locationSelect.value,
+              paymentMethod: paymentMethodInput.value.trim(),
+              limitCreditDay: limitCreditDayInput.value.trim(),
+              feeContract: feeContractInput.value.trim(),
+              monthlyFeeContract: monthlyFeeContractInput.value.trim(),
+              dateContractMonth: dateContractMonthInput.value.trim(),
+              contractValue: contractValueInput.value.trim(),
+              notes: notesInput.value.trim(),
+              description: descriptionInput.value.trim(),
+              listMemberJson, listBillingContactJson, techRegistrationsJson, listDeploymentJson,
+            });
+            const response = resp.result.data.response;
+            if (looksLikeFailureResponse(response)) {
+              step2Line.textContent = `✗ [3/3] InsertRegistration THẤT BẠI (server trả lỗi nghiệp vụ) — ${responseFailureMessage(response)} — response: ${JSON.stringify(response)}`;
+              step2Line.classList.add('is-error');
+              UI.toast('error', 'InsertRegistration thất bại: ' + responseFailureMessage(response));
+            } else {
+              step2Line.textContent = `✓ [3/3] InsertRegistration xong — response: ${JSON.stringify(response)}`;
+              UI.toast('success', `Tạo HĐ/PL ✓ — ${refCode}`);
+              if (autoApproveCheckbox.checked) {
+                await runAutoApprove(opportunityCode);
+              }
+            }
+          } catch (err) {
+            step2Line.textContent = '✗ [3/3] InsertRegistration lỗi: ' + (err.message || err);
+            step2Line.classList.add('is-error');
+            UI.toast('error', 'InsertRegistration lỗi: ' + (err.message || err));
+          }
+        } finally {
+          submitButton.disabled = false;
+        }
+      },
+    }, 'Thêm chi tiết');
+
+    const body = UI.h('div', null, phoneFormBody);
+    const footer = UI.h('div', { class: 'gen-footer' }, submitButton);
+
+    function renderBodyForType() {
+      const meta = currentServiceMeta();
+      body.innerHTML = '';
+      footer.innerHTML = '';
+      if (meta && meta.supported) {
+        body.appendChild(phoneFormBody);
+        footer.appendChild(submitButton);
+      } else {
+        body.appendChild(unsupportedBody);
+      }
+    }
+    renderBodyForType();
+
+    // Khối định danh (Tài khoản Sale/Mã cơ hội/Loại dịch vụ/Mã KH/RefCode/
+    // Mã số thuế) — luôn hiện, kể cả khi Loại dịch vụ đang chọn chưa hỗ
+    // trợ (body bên dưới đổi qua unsupportedBody nhưng vẫn phải chọn được
+    // lại Loại dịch vụ ở đây), nên tách riêng khỏi `body` (cái đổi qua lại
+    // theo currentServiceMeta()).
+    const identityBody = UI.h('div', { class: 'gen-body' },
+      UI.h('div', { class: 'field-grid' },
+        field('Tài khoản Sale', saleInput, 'vd sale01 — tự thêm @fpt.com nếu thiếu'),
+        UI.h('label', { class: 'd-block' },
+          UI.h('div', { class: 'field-label' }, UI.h('span', { class: 'lbl' }, 'Mã cơ hội')),
+          opportunityCodeInput,
+          UI.h('div', { style: 'margin-top: 4px;' }, oppLookupStatus))),
+      UI.h('div', { class: 'field-grid-3' },
+        field('Loại dịch vụ (Đấu số thoại)', typeSelect),
+        field('Mã khách hàng', customerIdInput, 'tự động lấy từ Mã cơ hội'),
+        field('RefCode', refCodeInput, 'tự động lấy từ Mã cơ hội'),
+        field('Mã số thuế KH', taxIdInput, 'tự động lấy từ Mã cơ hội')));
+
+    return UI.h('article', { class: 'gen-card' },
+      UI.h('header', { class: 'gen-header' },
+        UI.h('div', { class: 'd-flex justify-content-between align-items-start gap-2' },
+          UI.h('div', null,
+            UI.h('div', { class: 'gen-eyebrow' }, UI.h('span', { class: 'dot' }), 'Opportunity'),
+            UI.h('h3', { class: 'gen-title' }, 'Ivoice — Tạo yêu cầu HĐ/PL')),
+          UI.h('span', { class: 'gen-class' }, 'ivoice.lookup-opportunity → ivoice.create-registration-detail → bms.insert-registration')),
+        UI.h('p', { class: 'gen-signature' },
+          '✅ Đã xác nhận chạy thật thành công 2026-09-07 (CH00085411) — 1 nút chạy tuần tự Thêm chi tiết (IVOICE) rồi đến Bước 3 "Tạo" (BMS legacy, đẩy sang "Chờ BGĐ duyệt"), log hiện response thô của cả 2. Cần RegistrationId đã tồn tại sẵn (bước "Xác nhận tạo yêu cầu hợp đồng" vẫn thao tác tay).'),
+        UI.h('div', { style: 'margin-top: 6px;' }, derivedSummary)),
+      identityBody,
+      body,
+      footer);
+  }
   /**
    * Bolts real cascading/async dropdowns onto the opportunity.api card for
    * fields that are just raw-code text inputs otherwise (services, AM, TPP,
@@ -288,6 +1450,7 @@
     };
 
     mountTokenFetcher(card, getToken);
+    mountCreateCustomerButton(card);
 
     const servicePicker = UI.mountServicePicker(card, {
       getToken,
@@ -506,6 +1669,57 @@
    * (AM/TPP/BGĐ each have their own account); password defaults to the known
    * STG bypass code but stays editable in case an account needs a different one.
    */
+  /**
+   * "Loại khách hàng" dropdown + "Tạo KH mới" button next to the Customer ID
+   * field — for when the user doesn't have a real customerId handy. Per
+   * user request 2026-08-27 ("hiện field bắt buộc cho người dùng chọn muốn
+   * tạo loại nào xong mới click button"): the required "loại khách hàng"
+   * choice is a real select the user picks BEFORE clicking, not silently
+   * hardcoded — matches customer.create-random's `customerKind` param
+   * (see CreateRandomCustomerGenerator.java for the two supported shapes:
+   * Tổ chức nước ngoài / Cá nhân nước ngoài — both skip the Tỉnh/Phường
+   * cascading pickers, simplest to auto-fill correctly).
+   *
+   * Logs in as the CM account (admin01, same convention as
+   * mountHdPlApprovalCard), calls customer.create-random with the chosen
+   * kind, then fills the returned customerCode straight into the field —
+   * overwrites whatever was already typed, user opted in by clicking.
+   */
+  function mountCreateCustomerButton(card) {
+    const wrap = card.querySelector('[data-field="customerId"]');
+    const input = wrap ? wrap.querySelector('input') : null;
+    if (!wrap || !input) return;
+
+    const kindSelect = UI.h('select', { class: 'app-select', style: 'margin-top: 6px; width: auto; display: inline-block; margin-right: 6px;' },
+      UI.h('option', { value: 'to-chuc-nuoc-ngoai' }, 'Tổ chức nước ngoài'),
+      UI.h('option', { value: 'ca-nhan-nuoc-ngoai' }, 'Cá nhân nước ngoài'));
+
+    const btn = UI.h('button', {
+      type: 'button',
+      class: 'btn-generate',
+      style: 'margin-top: 6px; padding: 6px 14px; font-size: 12px; width: auto;',
+      onclick: async () => {
+        btn.disabled = true;
+        const original = btn.textContent;
+        btn.textContent = 'Đang tạo KH…';
+        try {
+          const { token } = await getCachedOrFreshCmToken('admin01@fpt.com');
+          const resp = await api.generate('customer.create-random', { cmToken: token, customerKind: kindSelect.value });
+          input.value = resp.result.data.customerCode;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          UI.toast('success', `Đã tạo KH mới: ${resp.result.data.customerCode}`);
+        } catch (err) {
+          UI.toast('error', 'Tạo KH mới lỗi: ' + (err.message || err));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = original;
+        }
+      },
+    }, 'Tạo KH mới');
+    wrap.appendChild(kindSelect);
+    wrap.appendChild(btn);
+  }
+
   function mountTokenFetcher(card) {
     const tokenWrap = card.querySelector('[data-field="bearerToken"]');
     if (!tokenWrap) return;
