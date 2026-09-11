@@ -59,6 +59,11 @@ code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
 .brand-text { display: flex; flex-direction: column; line-height: 1.05; }
 .brand-title { font-size: 13px; font-weight: 600; color: var(--ink-100); }
 .brand-sub { font-size: 9px; letter-spacing: .18em; text-transform: uppercase; color: var(--ink-400); }
+.nav-page-link {
+  font-size: 13px; font-weight: 600; color: var(--ink-300); text-decoration: none;
+  padding: 4px 2px; border-bottom: 2px solid transparent;
+}
+.nav-page-link:hover { color: var(--lime-400); border-bottom-color: var(--lime-400); }
 .app-search {
   background: var(--ink-900); border: 1px solid var(--ink-700); color: var(--ink-100);
   font-family: 'JetBrains Mono', monospace; font-size: 12px; min-width: 260px;
@@ -397,6 +402,13 @@ code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
   display: grid; gap: 12px;
   grid-template-columns: repeat(2, 1fr);
 }
+/* three-column grid — compact contract-term forms (user request 2026-09-07:
+   "mỗi thông tin 1 dòng nhìn dài dòng quá", matching the real BMS form's
+   own multi-column layout instead of stacking every field vertically) */
+.field-grid-3 {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(3, 1fr);
+}
 
 /* ---------- password field with show/hide eye toggle ---------- */
 .password-wrap { position: relative; }
@@ -447,4 +459,5 @@ code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
   .app-search { display: none; }
   .hero-title { font-size: 2.2rem; }
   .field-grid { grid-template-columns: 1fr; }
+  .field-grid-3 { grid-template-columns: 1fr; }
 }
