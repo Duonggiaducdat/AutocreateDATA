@@ -11,12 +11,12 @@ import com.fpt.autodata.service.GenerationService;
 import com.fpt.autodata.service.GeneratorRegistry;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
-import models.ServiceGroup;
+import com.fpt.autodata.model.ServiceGroup;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
-import utils.JsonUtil;
+import com.fpt.autodata.util.JsonUtil;
 
 import java.net.URI;
 import java.net.http.HttpClient;

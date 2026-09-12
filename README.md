@@ -1,134 +1,323 @@
-# Auto-Create DATA · Backend
+# AutocreateDATA — FTMS Test Data Generator
 
-Production-grade fullstack wrapper around the existing FTMS Selenium tool.
-
-```
-backend/
-└── src/main/java/com/fpt/autodata/
-    ├── AutoDataApplication.java
-    ├── config/                CORS, WebDriver props
-    ├── controller/            REST endpoints + global error handler
-    ├── service/               GeneratorRegistry, GenerationService, automation/
-    ├── generator/             Strategy interface + DTOs
-    │   └── impl/              One @Component per generator (auto-discovered)
-    └── model/                 Request/response DTOs
-└── src/main/resources/static/ Frontend: HTML + Bootstrap 5 + Vanilla JS
-    ├── index.html
-    ├── styles/main.css
-    └── js/{api,ui,app}.js
-```
-
-See [`memory/MEMORY.md`](memory/MEMORY.md) for the project's own dev knowledge
-base (architecture decisions, confirmed API contracts, known issues) — read
-that before extending the tool.
+Web app tạo dữ liệu test tự động cho hệ thống FTMS (FPT Telecom Management System).  
+Backend: **Spring Boot 3 + Selenium**. Frontend: **SPA tĩnh** phục vụ tại cùng port.
 
 ---
 
-## Architecture in 30 seconds
-
-- **Strategy + factory.** Every data type is a `Generator` implementation. `GeneratorRegistry` collects all `@Component`-annotated `Generator` beans into a `Map<String, Generator>` keyed by `type()`. To add a new generator, drop a class in `generator/impl/` — no other wiring.
-- **Self-describing catalog.** Each generator publishes its parameter list via `ParamSpec` (text, password, number, enum, multi-enum, boolean). The frontend renders form fields purely from this metadata, so backend changes propagate automatically — zero hardcoded UI.
-- **Layered.** `controller → service → generator → automation facade → page objects`. Each layer has one job.
-- **Stable error envelope.** `GlobalExceptionHandler` maps every exception to `ApiError {timestamp, status, error, message, path}`.
-
----
-
-## REST API
-
-| Method | Path | Body | Returns |
-|---|---|---|---|
-| `GET`  | `/api/health`     | — | `{ status, generators }` |
-| `GET`  | `/api/generators` | — | `[{ type, displayName, category, params, ... }]` |
-| `GET`  | `/api/services`   | — | Service-group/type catalog (`Services.json`) |
-| `GET`  | `/api/proxy/**`   | — | Server-side proxy to the real BMS API (forwards bearer token) |
-| `POST` | `/api/generate`   | `{ type, params }` | `{ result: { type, data, log, durationMs, ranAt } }` |
-| `GET`  | `/api/log`        | — | Recent audit log entries (`?n=50`) |
-
-Example:
-
-```bash
-curl -X POST http://localhost:8080/api/generate \
-  -H 'Content-Type: application/json' \
-  -d '{"type":"login","params":{"username":"sale@fpt.com","password":"..."}}'
-```
-
----
-
-## Run the backend
-
-Requires JDK 17+, Maven 3.9+, and (for the production Selenium path) Chrome installed locally.
+## Chạy nhanh
 
 ```bash
 mvn spring-boot:run
 # → http://localhost:8080
 ```
 
-Override config via env / CLI:
-
-```bash
-mvn spring-boot:run \
-  -Dspring-boot.run.arguments="--autodata.webdriver.headless=false --server.port=9090"
-```
-
-Build a fat JAR:
-
-```bash
-mvn clean package
-java -jar target/auto-create-data-backend-1.0.0.jar
-```
-
-The frontend is served automatically from `src/main/resources/static/` —
-visit `http://localhost:8080` directly, no separate frontend server needed.
+Yêu cầu: Java 17+, Maven 3.8+, Google Chrome (ChromeDriver tự tải qua WebDriverManager).
 
 ---
 
-## Adding a new generator
+## Cấu trúc source code
 
-Naming convention: class `PascalCaseGenerator` in `generator/impl/`, `type()`
-is a lowercase dotted key `domain.action` (e.g. `opportunity.step1`,
-`auth.get-token`), grouped under a `category()` for the UI (e.g.
-`Authentication`, `Opportunity`, `IDC`).
+```
+src/main/java/com/fpt/autodata/
+│
+├── AutoDataApplication.java          # Entry point Spring Boot
+│
+├── controller/
+│   ├── GenerationController.java     # REST API: /api/health, /api/generators,
+│   │                                 #           /api/generate, /api/proxy, /api/services, /api/log
+│   └── GlobalExceptionHandler.java   # Xử lý lỗi toàn app → JSON response chuẩn
+│
+├── generator/                        # Framework — KHÔNG sửa khi thêm script mới
+│   ├── Generator.java                # Interface mọi script phải implement
+│   ├── GenerationResult.java         # Object kết quả trả về
+│   ├── GeneratorException.java       # Exception chuẩn của framework
+│   ├── ParamSpec.java                # Định nghĩa 1 param (tên, kiểu, label, default)
+│   ├── ParamType.java                # Enum: TEXT | PASSWORD | ENUM | BOOLEAN | NUMBER | ...
+│   ├── Params.java                   # Helper đọc param từ Map (requireString, optInt...)
+│   └── impl/
+│       ├── AbstractGenerator.java    # Base class Selenium: quản lý HTTP client + log
+│       │
+│       ├── auth/                     # [SHARED] Selenium login — lấy token/session
+│       ├── customer/                 # [SHARED] Quản lý khách hàng qua CM
+│       ├── opportunity/              # [SHARED] Vòng đời cơ hội BMS
+│       ├── registration/             # [SHARED] Duyệt Hợp đồng / Phụ lục
+│       └── service/                  # [PER-SERVICE] Scripts riêng từng loại dịch vụ
+│           ├── ivoice/               #   IVOICE — login: sm/v2
+│           ├── sm/                   #   SM     — login: sm/v2
+│           ├── mes/                  #   MES    — login: sm/v2
+│           ├── idc/                  #   IDC    — login: /idc  (apis-stag.fpt.net)
+│           └── ll/                   #   LL     — login: /ll   (session cookie)
+│
+├── service/
+│   ├── GenerationService.java        # Điều phối thực thi: nhận request → gọi generator
+│   ├── GeneratorRegistry.java        # Auto-discover @Component Generator beans
+│   └── automation/
+│       ├── FtmsAutomation.java       # Facade Selenium: cấp driver → chạy → đóng, chụp ảnh lỗi
+│       └── WebDriverFactory.java     # Tạo ChromeDriver headless theo config
+│
+├── selenium/                         # Page Objects Selenium
+│   ├── BasePage.java                 # Base class: click, sendKeys, wait, scroll...
+│   └── LoginPage.java                # Màn hình đăng nhập FTMS
+│
+├── audit/
+│   ├── AuditEntry.java               # Data class 1 dòng log
+│   └── AuditService.java             # Ghi/đọc audit.jsonl → Activity Log trên UI
+│
+├── config/
+│   ├── AutodataProperties.java       # Bind application.yml → Java object
+│   ├── WebConfig.java                # CORS + forward /ivoice → index.html
+│   └── WebDriverConfig.java          # Khởi tạo ChromeDriver manager lúc startup
+│
+├── model/
+│   ├── GenerateRequest.java          # Request body: POST /api/generate
+│   ├── GenerateResponse.java         # Response body: POST /api/generate
+│   ├── GeneratorMetadata.java        # Metadata 1 generator → GET /api/generators
+│   ├── ServiceGroup.java             # DTO parse Services.json
+│   └── ApiError.java                 # Response shape khi lỗi HTTP
+│
+└── util/
+    └── JsonUtil.java                 # Load file JSON từ classpath (Services.json...)
+```
 
-1. Create `src/main/java/com/fpt/autodata/generator/impl/MyThingGenerator.java`:
+---
+
+## Generators hiện có
+
+### `impl/auth/` — Xác thực
+
+**Login mapping theo domain:**
+
+| App | Domain | SSO endpoint |
+|---|---|---|
+| BMS | `ftms-stag.fpt.net/bmsv2/` | `ftms-stag.fpt.net/api/bam/auth/sso` |
+| SM/IVOICE/MES | `ftms-stag.fpt.net/sm/v2/` | `ftisapi-stag.fpt.net/sm/v2/api/auth/sso/login` |
+| IDC | `ftms-stag.fpt.net/idc` | `apis-stag.fpt.net/idc/api/auth/sso` |
+| CM | `ftms-stag.fpt.net/cm/` | `ftms-stag.fpt.net/gwcm/api/Auth/LoginSSO` |
+| LL | `ftms-stag.fpt.net/ll` | server-side cookie (SignInCas pattern) |
+| IVOICE old | `ftms-stag.fpt.net/ivoice/` | server-side cookie (IVOICE_USER_*) |
+| BMS Legacy | `ftms-stag.fpt.net/bms/` | server-side cookie (FTIBMS-Auth) |
+
+---
+
+**BMS (bmsv2):**
+
+| Class | API type | Cách login | Mô tả |
+|---|---|---|---|
+| `GetTokenApiGenerator` | `auth.get-token-api` | **Pure API** (~1-2s) | GET /id/login → POST form → POST /api/bam/auth/sso → JWT BMS. TGT cache cho refresh. |
+
+**SM/v2 (IVOICE mới, SM, MES và các dịch vụ trên sm/v2):**
+
+| Class | API type | Cách login | Mô tả |
+|---|---|---|---|
+| `GetSmTokenApiGenerator` | `auth.get-sm-token-api` | **Pure API** (~2-3s) | TGT → GET /id/login?service=/sm/v2/ → POST ftisapi/sm/v2/api/auth/sso/login → JWT SM. |
+
+**IDC và LL:**
+
+| Class | API type | Mô tả |
+|---|---|---|
+| `GetIdcTokenApiGenerator` | `auth.get-idc-token-api` | TGT → POST apis-stag/idc/api/auth/sso → JWT IDC |
+| `GetLlSessionApiGenerator` | `auth.get-ll-session-api` | TGT → /ll/account/signincas → LL session cookies |
+
+**Các app riêng (vẫn dùng Selenium khi chưa có TGT):**
+
+| Class | API type | Cách login | Mô tả |
+|---|---|---|---|
+| `GetCmTokenApiGenerator` | `auth.get-cm-token-api` | API+fallback | TGT → /gwcm/api/Auth/LoginSSO → JWT CM. Fallback Selenium nếu chưa có TGT. |
+| `GetIvoiceSessionApiGenerator` | `auth.get-ivoice-session-api` | API+fallback | TGT → GET /ivoice/?1=1&ticket → IVOICE cookies. Fallback Selenium. |
+| `GetBmsLegacySessionApiGenerator` | `auth.get-bms-legacy-session-api` | API+fallback | TGT → /bms/Account/SignInCas → FTIBMS-Auth cookie. Fallback Selenium. |
+| `GetCmTokenGenerator` | `auth.get-cm-token` | Selenium | Selenium fallback cho CM |
+| `GetIvoiceSessionGenerator` | `auth.get-ivoice-session` | Selenium | Selenium fallback cho IVOICE |
+| `GetBmsLegacySessionGenerator` | `auth.get-bms-legacy-session` | Selenium | Selenium fallback cho BMS Legacy |
+
+### `impl/customer/` — Khách hàng
+
+| Class | API type | Mô tả |
+|---|---|---|
+| `CreateRandomCustomerGenerator` | `customer.create-random` | Tạo khách hàng ngẫu nhiên qua CM API |
+
+### `impl/opportunity/` — Vòng đời cơ hội
+
+| Class | API type | Mô tả |
+|---|---|---|
+| `OpportunityApiGenerator` | `opportunity.api` | Tạo cơ hội qua REST API |
+| `EvaluateOpportunityGenerator` | `evaluation.evaluate` | TPP đánh giá cơ hội |
+| `ApproveOpportunityGenerator` | `evaluation.approve` | BGĐ phê duyệt cơ hội |
+| `QuotationGenerator` | `opportunity.quotation` | Tạo báo giá đính kèm dummy.pdf |
+| `StageAdvanceGenerator` | `opportunity.stage-advance` | Chuyển hết vòng đời cơ hội (tiến độ 100%) |
+| `StageNoteGenerator` | `opportunity.stage-note` | Ghi chú vào tất cả giai đoạn |
+
+### `impl/registration/` — Duyệt Hợp đồng / Phụ lục
+
+| Class | API type | Mô tả |
+|---|---|---|
+| `LookupRegistrationGenerator` | `registration.lookup` | Tra Mã YC → tìm opportunityId + BGĐ phụ trách |
+| `ApproveRegistrationGenerator` | `registration.approve-bms` | BGĐ duyệt HĐ/PL bên BMS |
+| `ApproveContractCmGenerator` | `registration.approve-cm` | Duyệt HĐ/PL bên CM app |
+
+### `impl/service/mes/` — MES
+
+| Class | API type | Mô tả |
+|---|---|---|
+| *(chưa có scripts)* | — | Dùng `auth.get-sm-token-api` để login |
+
+### `impl/service/ivoice/` — Đấu số thoại
+
+| Class | API type | Mô tả |
+|---|---|---|
+| `LookupOpportunityForIvoiceGenerator` | `ivoice.lookup-opportunity` | Từ mã cơ hội → tìm RefCode, Mã KH, RegistrationId |
+| `GetIvoiceWardGenerator` | `ivoice.get-ward` | Lấy danh sách Phường/Xã theo tỉnh thành |
+| `GetIvoicePhoneBookedGenerator` | `ivoice.get-phone-booked` | Tìm số điện thoại đã book khả dụng |
+| `InsertIvoiceRegistrationGenerator` | `ivoice.create-registration-detail` | Tạo phiếu triển khai chi tiết (IVOICE) |
+| `CheckServiceIntegrateGenerator` | `ivoice.check-service-integrate` | Pre-check tích hợp dịch vụ trước khi Tạo |
+| `InsertBmsRegistrationGenerator` | `ivoice.insert-registration` | Tạo HĐ/PL Bước 3 (BMS legacy — chỉ dùng cho IVOICE) |
+
+---
+
+## Thêm script mới
+
+### Bước 1 — Xác định script thuộc nhóm nào
+
+```
+Dùng chung mọi dịch vụ?
+  ├── Xác thực / login           →  impl/auth/
+  ├── Quản lý khách hàng         →  impl/customer/
+  ├── Tạo / xử lý cơ hội BMS    →  impl/opportunity/
+  └── Duyệt HĐ/PL               →  impl/registration/
+
+Riêng 1 loại dịch vụ?
+  └── impl/service/<tên>/
+        ivoice/    IVOICE — login: auth.get-sm-token-api
+        sm/        SM     — login: auth.get-sm-token-api
+        mes/       MES    — login: auth.get-sm-token-api
+        idc/       IDC    — login: auth.get-idc-token-api
+        ll/        LL     — login: auth.get-ll-session-api
+```
+
+### Bước 2 — Tạo class, implement interface `Generator`
 
 ```java
-@Component
-public class MyThingGenerator extends AbstractGenerator {
-    public MyThingGenerator(FtmsAutomation a) { super(a); }
-    @Override public String type()        { return "my.thing"; }
-    @Override public String displayName() { return "My Thing"; }
-    @Override public String category()    { return "Custom"; }
-    @Override public List<ParamSpec> params() {
-        return List.of(ParamSpec.text("foo").required().defaultValue("bar"));
+package com.fpt.autodata.generator.impl.service.ll; // đặt đúng package
+
+import com.fpt.autodata.generator.*;
+import org.springframework.stereotype.Component;
+import java.util.List;
+import java.util.Map;
+
+@Component  // bắt buộc — Spring tự đăng ký, không cần wiring thêm
+public class MyLlGenerator implements Generator {
+
+    @Override public String type()        { return "ll.my-action"; }
+    @Override public String displayName() { return "Tên hiển thị trên UI"; }
+    @Override public String category()    { return "LL"; }
+    @Override public String description() { return "Mô tả ngắn."; }
+
+    @Override
+    public List<ParamSpec> params() {
+        return List.of(
+            ParamSpec.password("bearerToken").label("Bearer Token").required(),
+            ParamSpec.text("vmName").label("Tên VM").required(),
+            ParamSpec.number("cpuCores").label("CPU (cores)").defaultValue("2")
+        );
     }
-    @Override public GenerationResult generate(Map<String, Object> p) {
-        String foo = Params.requireString(p, "foo");
-        return result().put("foo", foo).build();
+
+    @Override
+    public GenerationResult generate(Map<String, Object> p) {
+        String token = Params.requireString(p, "bearerToken");
+        String param = Params.requireString(p, "vmName");
+
+        // ... gọi API ...
+
+        return GenerationResult.builder(type())
+            .put("result", "ok")
+            .build();
     }
 }
 ```
 
-2. Restart backend. The card appears in the UI automatically — no frontend changes needed.
+**Xong.** Restart app → generator tự xuất hiện ở `GET /api/generators` và trên UI.
 
-Two implementation patterns coexist — see
-[`memory/architecture.md`](memory/architecture.md) before choosing one:
-- **Selenium generator** (most existing ones): extend `AbstractGenerator`, inject `FtmsAutomation`, drive a `pages.*` Page Object.
-- **Direct-API generator** (e.g. `OpportunityApiGenerator`): implement `Generator` directly, no browser, one HTTP call via `java.net.http.HttpClient`. Only where the real BMS REST contract is confirmed — document it in [`memory/api-contracts.md`](memory/api-contracts.md).
+### Bước 3 — Nếu script cần Selenium
+
+Extend `AbstractGenerator` thay vì implement `Generator` trực tiếp:
+
+```java
+import com.fpt.autodata.generator.impl.AbstractGenerator;
+import com.fpt.autodata.selenium.LoginPage;
+import com.fpt.autodata.service.automation.FtmsAutomation;
+
+@Component
+public class MySeleniumGenerator extends AbstractGenerator {
+
+    public MySeleniumGenerator(FtmsAutomation automation) {
+        super(automation);
+    }
+
+    @Override
+    public GenerationResult generate(Map<String, Object> p) {
+        String username = Params.requireString(p, "username");
+        String password = Params.requireString(p, "password");
+        List<String> log = newLog();
+
+        automation.withDriver(driver -> {
+            new LoginPage(driver).login(username, password);
+            // ... thao tác Selenium ...
+            trace(log, "done");
+        });
+
+        return result().log(log).build();
+    }
+}
+```
 
 ---
 
-## Run the frontend
+## Kiểu param hỗ trợ
 
-Nothing separate to run — it's bundled as Spring static resources
-(`src/main/resources/static/`) and served by the backend itself at
-`http://localhost:8080`.
+| `ParamType` | Builder helper | Hiển thị trên UI |
+|---|---|---|
+| `TEXT` | `ParamSpec.text("name")` | Input text |
+| `PASSWORD` | `ParamSpec.password("token")` | Input password (ẩn) |
+| `NUMBER` | `ParamSpec.number("count")` | Input number |
+| `ENUM` | `ParamSpec.enumOf("type", List.of(...))` | Dropdown |
+| `MULTI_ENUM` | `ParamSpec.multiEnum("services", List.of(...))` | Multi-select |
+| `BOOLEAN` | `ParamSpec.bool("headless")` | Checkbox |
 
 ---
 
-## Notes for production
+## REST API
 
-- **Chrome / driver.** `WebDriverFactory` uses `WebDriverManager` which downloads a matching driver on startup. In a sandboxed deploy, mount Chrome into the image (e.g. `selenium/standalone-chrome`).
-- **Concurrency.** Each request creates and tears down its own driver. For session continuity (login + downstream actions over multiple HTTP calls), introduce a `SessionManager` keyed by a `sessionId` request param.
-- **Secrets.** ⚠️ See [`memory/known-issues.md`](memory/known-issues.md) — reviewer credentials currently live in `application.yml` in plaintext and need rotating + moving to environment variables before any wider access to this repo.
-- **CORS.** Allowed origins are listed in `autodata.cors.allowed-origins`. Add your prod frontend origin there.
-- **Observability.** Method-level logs use SLF4J (`com.fpt.autodata` namespace). Wire to your aggregator (Loki / Datadog / etc.).
+| Method | Endpoint | Mô tả |
+|---|---|---|
+| `GET` | `/api/health` | Liveness check |
+| `GET` | `/api/generators` | Danh sách tất cả generators + params |
+| `POST` | `/api/generate` | Chạy 1 generator: `{"type":"...", "params":{...}}` |
+| `GET` | `/api/services` | Danh sách nhóm/loại dịch vụ từ Services.json |
+| `GET` | `/api/proxy/**` | Proxy GET đến BMS API (tự đính kèm Authorization header) |
+| `GET` | `/api/log?n=50` | Xem lịch sử chạy gần nhất |
+
+---
+
+## Cấu hình (`application.yml`)
+
+```yaml
+autodata:
+  webdriver:
+    headless: true              # false để xem Selenium chạy trực quan
+    base-url: https://ftms-stag.fpt.net
+    screenshot-on-error: true   # chụp ảnh màn hình khi Selenium lỗi
+    screenshot-dir: screenshots
+
+  api:
+    base-url: https://ftisapi-stag.fpt.net/bms-service/api
+    timeout-seconds: 15
+
+  defaults:
+    reviewer-username: chuyennt5@fpt.com
+    reviewer-password: ISC22QC
+
+  cors:
+    allowed-origins:
+      - http://localhost:5173
+      - http://localhost:3000
+```

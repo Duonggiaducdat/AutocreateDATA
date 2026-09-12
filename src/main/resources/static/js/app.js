@@ -153,8 +153,8 @@
     if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) {
       return { token: cached.token, cached: true };
     }
-    const resp = await api.generate('auth.get-token', { username: email, password: DEFAULT_OTP_PASSWORD });
-    const token = resp.result.data.token;
+    const resp = await api.generate('auth.get-token-api', { username: email, password: DEFAULT_OTP_PASSWORD });
+    const token = resp.result.data.accessToken;
     tokenCache.set(email, { token, fetchedAt: Date.now() });
     return { token, cached: false };
   }
@@ -1327,7 +1327,7 @@
           checkLine.textContent = `⏳ [2/3] Đang gọi CheckServiceIntergrate cho ${refCode}…`;
           try {
             const refKeysJson = JSON.stringify(JSON.parse(listDeploymentJson).map((d) => d.refCodeOfIntegrated));
-            const checkResp = await api.generate('bms.check-service-integrate', {
+            const checkResp = await api.generate('ivoice.check-service-integrate', {
               cookieHeader: bmsCookieHeader,
               refCode,
               serviceGroup: meta.serviceGroup,
@@ -1347,7 +1347,7 @@
           const step2Line = addLine();
           step2Line.textContent = `⏳ [3/3] Đang gọi InsertRegistration (Bước 3 "Tạo") cho ${refCode}…`;
           try {
-            const resp = await api.generate('bms.insert-registration', {
+            const resp = await api.generate('ivoice.insert-registration', {
               cookieHeader: bmsCookieHeader, bearerToken,
               opportunityCode, registrationId, customerId,
               serviceGroup: meta.serviceGroup,
@@ -1428,7 +1428,7 @@
           UI.h('div', null,
             UI.h('div', { class: 'gen-eyebrow' }, UI.h('span', { class: 'dot' }), 'Opportunity'),
             UI.h('h3', { class: 'gen-title' }, 'Ivoice — Tạo yêu cầu HĐ/PL')),
-          UI.h('span', { class: 'gen-class' }, 'ivoice.lookup-opportunity → ivoice.create-registration-detail → bms.insert-registration')),
+          UI.h('span', { class: 'gen-class' }, 'ivoice.lookup-opportunity → ivoice.create-registration-detail → ivoice.insert-registration')),
         UI.h('p', { class: 'gen-signature' },
           '✅ Đã xác nhận chạy thật thành công 2026-09-07 (CH00085411) — 1 nút chạy tuần tự Thêm chi tiết (IVOICE) rồi đến Bước 3 "Tạo" (BMS legacy, đẩy sang "Chờ BGĐ duyệt"), log hiện response thô của cả 2. Cần RegistrationId đã tồn tại sẵn (bước "Xác nhận tạo yêu cầu hợp đồng" vẫn thao tác tay).'),
         UI.h('div', { style: 'margin-top: 6px;' }, derivedSummary)),
@@ -1661,15 +1661,6 @@
   }
 
   /**
-   * "Lấy Token" button — calls the auth.get-token generator (real Selenium
-   * login, see memory/api-contracts.md "Login flow") and writes the result
-   * straight into the Bearer Token field, dispatching `input` so the existing
-   * auto-load-on-blur wiring picks it up the same as if it'd been pasted by
-   * hand. Username is free-text since different steps need different roles
-   * (AM/TPP/BGĐ each have their own account); password defaults to the known
-   * STG bypass code but stays editable in case an account needs a different one.
-   */
-  /**
    * "Loại khách hàng" dropdown + "Tạo KH mới" button next to the Customer ID
    * field — for when the user doesn't have a real customerId handy. Per
    * user request 2026-08-27 ("hiện field bắt buộc cho người dùng chọn muốn
@@ -1735,11 +1726,11 @@
       const username = userInput.value.trim();
       const password = passInput.value.trim();
       if (!username) { statusEl.textContent = 'Điền username/email trước đã.'; return; }
-      statusEl.textContent = 'Đang đăng nhập (Selenium, có thể mất ~10-15s)…';
+      statusEl.textContent = 'Đang đăng nhập (API, ~1-2s)…';
       fetchBtn.disabled = true;
       try {
-        const resp = await api.generate('auth.get-token', { username, password });
-        tokenInput.value = resp.result.data.token;
+        const resp = await api.generate('auth.get-token-api', { username, password });
+        tokenInput.value = resp.result.data.accessToken;
         tokenInput.dispatchEvent(new Event('input', { bubbles: true }));
         tokenInput.dispatchEvent(new Event('blur', { bubbles: true }));
         statusEl.textContent = `Đã lấy token cho ${username} ✓`;
