@@ -3,7 +3,6 @@ package com.fpt.autodata.generator.impl.auth;
 import com.fpt.autodata.config.AutodataProperties;
 import com.fpt.autodata.generator.Generator;
 import com.fpt.autodata.generator.GenerationResult;
-import org.springframework.context.annotation.Lazy;
 import com.fpt.autodata.generator.GeneratorException;
 import com.fpt.autodata.generator.ParamSpec;
 import com.fpt.autodata.generator.Params;
@@ -44,17 +43,15 @@ public class GetBmsLegacySessionApiGenerator implements Generator {
     private static final Pattern CAS_PAT       = Pattern.compile(
         "service=(https?://[^\"&\\s]+SignInCas[^\"&\\s]*)");
     private static final Pattern TICKET_PAT    = Pattern.compile("[?&]ticket=(ST-[^&\\s\\r\\n]+)");
+    private static final Pattern EXECUTION_PAT = Pattern.compile("name=\"execution\"\\s+value=\"([^\"]+)\"");
     private static final String LEGACY_COOKIE  = "FTIBMS-Auth";
 
-    private final Duration                    timeout;
-    private final CasTgtCache                 tgtCache;
-    private final GetBmsLegacySessionGenerator seleniumFallback;
+    private final Duration    timeout;
+    private final CasTgtCache tgtCache;
 
-    public GetBmsLegacySessionApiGenerator(AutodataProperties props, CasTgtCache tgtCache,
-                                            @Lazy GetBmsLegacySessionGenerator seleniumFallback) {
-        this.timeout          = Duration.ofSeconds(props.getApi().getTimeoutSeconds());
-        this.tgtCache         = tgtCache;
-        this.seleniumFallback = seleniumFallback;
+    public GetBmsLegacySessionApiGenerator(AutodataProperties props, CasTgtCache tgtCache) {
+        this.timeout  = Duration.ofSeconds(props.getApi().getTimeoutSeconds());
+        this.tgtCache = tgtCache;
     }
 
     @Override public String type()        { return "auth.get-bms-legacy-session-api"; }
@@ -138,7 +135,9 @@ public class GetBmsLegacySessionApiGenerator implements Generator {
                 "Kiểm tra refCode có hợp lệ không.");
         }
 
-        // ── Step 2: GET CAS với TGT → ticket ───────────────────────────────
+        // ── Step 2: GET CAS với TGT → ticket (nếu TGT còn hạn) ──────────────
+        //           Nếu TGT hết hạn → POST credentials để lấy ticket mới (pure API, không Selenium)
+        //           Note: Selenium fallback đã broken vì /bms/OppsMagt/Create redirect sang bmsv2 (confirmed 2026-09-12)
         CookieManager tgtCookies = tgtCache.getOrCreate(username);
         HttpClient tgtClient = HttpClient.newBuilder()
             .connectTimeout(timeout)
@@ -159,54 +158,97 @@ public class GetBmsLegacySessionApiGenerator implements Generator {
             if (resp.statusCode() == 302) {
                 Matcher m = TICKET_PAT.matcher(resp.headers().firstValue("location").orElse(""));
                 if (m.find()) ticket = m.group(1);
+            } else if (resp.statusCode() == 200 && ticket == null) {
+                // TGT hết hạn — parse execution token và POST credentials để lấy ticket mới
+                Matcher execM = EXECUTION_PAT.matcher(resp.body());
+                String execution = execM.find() ? execM.group(1) : "e1s1";
+                String formBody = "username=" + java.net.URLEncoder.encode(username, java.nio.charset.StandardCharsets.UTF_8)
+                    + "&password=" + java.net.URLEncoder.encode(password, java.nio.charset.StandardCharsets.UTF_8)
+                    + "&execution=" + java.net.URLEncoder.encode(execution, java.nio.charset.StandardCharsets.UTF_8)
+                    + "&_eventId=submit&language=vi&countLogin=0&hasError=0&errorMsg=";
+                HttpRequest postReq = HttpRequest.newBuilder()
+                    .uri(URI.create(fullCasUrl))
+                    .timeout(timeout)
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .header("User-Agent", "Mozilla/5.0")
+                    .header("Referer", fullCasUrl)
+                    .POST(HttpRequest.BodyPublishers.ofString(formBody))
+                    .build();
+                HttpResponse<String> postResp = tgtClient.send(postReq, HttpResponse.BodyHandlers.ofString());
+                if (postResp.statusCode() == 302) {
+                    Matcher m = TICKET_PAT.matcher(postResp.headers().firstValue("location").orElse(""));
+                    if (m.find()) ticket = m.group(1);
+                }
             }
         } catch (Exception e) {
-            throw new GeneratorException("Step 2 GET CAS ticket lỗi: " + e.getMessage(), e);
+            throw new GeneratorException("Step 2 GET/POST CAS ticket lỗi: " + e.getMessage(), e);
         }
 
         if (ticket == null) {
-            return seleniumFallback.generate(p);
+            throw new GeneratorException(
+                "Không lấy được CAS ticket cho BMS legacy (TGT hết hạn và POST credentials cũng thất bại). " +
+                "Kiểm tra username/password.");
         }
 
-        // ── Step 3: GET SignInCas?state=...&ticket=... → FTIBMS-Auth cookie ─
+        // ── Step 3: SignInCas → follow redirect → CreateRegist (cùng 1 luồng) ──
+        // Browser thật: SignInCas set FTIBMS-Auth → 302 → CreateRegist.
+        // Sau đó cần visit lại CreateRegist lần 2 để server set đủ FTIBMS + jwt_token_id
+        // (observed: lần đầu chỉ có FTIBMS-Auth, lần 2 mới có đủ 3 cookies cần thiết).
         String signInUrl = casServiceUrl + "&ticket=" + ticket;
         try {
-            HttpRequest req = HttpRequest.newBuilder()
-                .uri(URI.create(signInUrl))
-                .timeout(timeout)
-                .header("User-Agent", "Mozilla/5.0")
-                .GET().build();
-            HttpResponse<String> resp = bmsClient.send(req, HttpResponse.BodyHandlers.ofString());
+            HttpClient authClient = HttpClient.newBuilder()
+                .connectTimeout(timeout)
+                .cookieHandler(bmsCookies)
+                .followRedirects(HttpClient.Redirect.NORMAL)
+                .build();
 
-            // Collect cookies từ Set-Cookie hoặc CookieManager
-            List<String> setCookies = resp.headers().allValues("set-cookie");
-            String cookieHeader;
-            if (!setCookies.isEmpty()) {
-                cookieHeader = setCookies.stream()
-                    .map(h -> h.split(";")[0].trim())
-                    .collect(Collectors.joining("; "));
-            } else {
-                cookieHeader = bmsCookies.getCookieStore().getCookies().stream()
-                    .map(c -> c.getName() + "=" + c.getValue())
-                    .collect(Collectors.joining("; "));
-            }
+            // Lần 1: SignInCas → CreateRegist (server set FTIBMS-Auth, thiếu FTIBMS + jwt_token_id)
+            authClient.send(
+                HttpRequest.newBuilder()
+                    .uri(URI.create(signInUrl))
+                    .timeout(timeout)
+                    .header("User-Agent", "Mozilla/5.0")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+
+            // Lần 2: Visit lại CreateRegist với FTIBMS-Auth → server set FTIBMS + jwt_token_id
+            authClient.send(
+                HttpRequest.newBuilder()
+                    .uri(URI.create(CREATE_REGIST + refCode))
+                    .timeout(timeout)
+                    .header("User-Agent", "Mozilla/5.0")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Referer", BASE + "/bms/OppsMagt/List")
+                    .GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+
+            // Sau khi follow redirect chain, bmsCookies có đầy đủ cookies từ cả SignInCas và CreateRegist
+            List<java.net.HttpCookie> allCookies = bmsCookies.getCookieStore().getCookies();
+            // Log cookie names để debug (không log values vì sensitive)
+            String cookieNames = allCookies.stream().map(java.net.HttpCookie::getName)
+                .collect(Collectors.joining(", "));
+            String cookieHeader = allCookies.stream()
+                .map(c -> c.getName() + "=" + c.getValue())
+                .collect(Collectors.joining("; "));
 
             if (!cookieHeader.contains(LEGACY_COOKIE)) {
                 throw new GeneratorException(
-                    "FTIBMS-Auth cookie không xuất hiện sau SignInCas. " +
-                    "HTTP " + resp.statusCode() + ". Cookies: " + cookieHeader);
+                    "FTIBMS-Auth cookie không xuất hiện sau SignInCas → CreateRegist. " +
+                    "Cookies hiện có: [" + cookieNames + "]");
             }
 
             return GenerationResult.builder(type())
                 .put("username", username)
                 .put("refCode", refCode)
                 .put("cookieHeader", cookieHeader)
+                .put("cookieNames", cookieNames) // debug: xem có đủ FTIBMS + jwt_token_id không
                 .put("durationMs", System.currentTimeMillis() - t0)
                 .build();
         } catch (GeneratorException e) {
             throw e;
         } catch (Exception e) {
-            throw new GeneratorException("Step 3 SignInCas lỗi: " + e.getMessage(), e);
+            throw new GeneratorException("Step 3 SignInCas/CreateRegist lỗi: " + e.getMessage(), e);
         }
     }
 

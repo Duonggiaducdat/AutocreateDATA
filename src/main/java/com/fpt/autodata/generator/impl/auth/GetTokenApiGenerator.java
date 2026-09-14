@@ -46,11 +46,13 @@ import java.util.regex.Pattern;
 @Component
 public class GetTokenApiGenerator implements Generator {
 
-    private static final String BASE        = "https://ftms-stag.fpt.net";
-    private static final String CAS_LOGIN   = BASE + "/id/login";
-    private static final String SSO_URL     = BASE + "/api/bam/auth/sso";
-    private static final String SERVICE     = "https%3A%2F%2Fftms-stag.fpt.net";
-    private static final String LOGIN_URL   = CAS_LOGIN + "?service=" + SERVICE;
+    private static final String BASE            = "https://ftms-stag.fpt.net";
+    private static final String CAS_LOGIN       = BASE + "/id/login";
+    // SSO endpoint của BMS service backend — confirmed live 2026-09-12 bằng network capture khi bmsv2 SPA bootstrap
+    private static final String SSO_URL         = "https://ftisapi-stag.fpt.net/bms-service/api/auth/sso";
+    // service URL phải có path /bmsv2/ — đây là service CAS của bmsv2 SPA, không phải root domain
+    private static final String SERVICE_ENCODED = "https%3A%2F%2Fftms-stag.fpt.net%2Fbmsv2%2F";
+    private static final String LOGIN_URL       = CAS_LOGIN + "?service=" + SERVICE_ENCODED;
 
     private static final Pattern EXECUTION_PAT = Pattern.compile("name=\"execution\"\\s+value=\"([^\"]+)\"");
     private static final Pattern TICKET_PAT    = Pattern.compile("[?&]ticket=(ST-[^&\\s\\r\\n]+)");
@@ -195,7 +197,8 @@ public class GetTokenApiGenerator implements Generator {
         }
 
         // ── Step 3: Exchange ticket → accessToken ────────────────────────────
-        String ssoBody = String.format("{\"token\":\"%s\",\"service\":\"%s\"}", ticket, SERVICE);
+        // service phải URL-encoded trong JSON body — confirmed live 2026-09-12 từ network capture bmsv2 SPA
+        String ssoBody = String.format("{\"token\":\"%s\",\"service\":\"%s\"}", ticket, SERVICE_ENCODED);
         String accessToken, refreshToken, userName;
 
         try {
@@ -216,14 +219,18 @@ public class GetTokenApiGenerator implements Generator {
             HttpResponse<String> resp = ssoClient.send(req, HttpResponse.BodyHandlers.ofString());
             JsonNode root = mapper.readTree(resp.body());
 
-            if (resp.statusCode() != 200 || !"OK".equals(root.path("status").asText())) {
+            // bms-service/api/auth/sso trả {"data":{...},"success":true} — khác format cũ {"status":"OK","data":{...}}
+            boolean ok = resp.statusCode() == 200 &&
+                (root.path("success").asBoolean(false) || "OK".equals(root.path("status").asText()));
+            if (!ok) {
                 throw new GeneratorException("Step 3 auth/sso thất bại: " + resp.body());
             }
 
             JsonNode data = root.path("data");
             accessToken  = data.path("accessToken").asText();
-            refreshToken = data.path("refreshToken").asText();
-            userName     = data.path("userName").asText();
+            refreshToken = data.path("refreshToken").asText(null);
+            // bms-service endpoint trả "username" thay vì "userName"
+            userName     = data.path("userName").asText(data.path("username").asText());
         } catch (GeneratorException e) {
             throw e;
         } catch (Exception e) {

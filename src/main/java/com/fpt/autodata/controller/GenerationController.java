@@ -184,7 +184,12 @@ public class GenerationController {
         for (var entry : result.getData().entrySet()) {
             String key = entry.getKey().toLowerCase();
             boolean sensitive = SENSITIVE_KEYS.stream().anyMatch(key::contains);
-            if (!sensitive) return entry.toString();
+            if (!sensitive) {
+                String val = String.valueOf(entry.getValue());
+                // Truncate long values (e.g. arrays/lists) — keep only first 80 chars
+                String truncated = val.length() > 80 ? val.substring(0, 80) + "…" : val;
+                return entry.getKey() + "=" + truncated;
+            }
         }
         return "ok";
     }

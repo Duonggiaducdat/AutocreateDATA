@@ -145,14 +145,15 @@
   // happens once per account per ~50 min instead of on every single
   // create→evaluate/approve run. Cleared on page reload (in-memory only —
   // not worth persisting across reloads given the short TTL).
-  const TOKEN_CACHE_TTL_MS = 50 * 60 * 1000;
+  const TOKEN_CACHE_TTL_MS = 30 * 60 * 1000; // 30 phút — JWT BMS có TTL ~60 phút, giữ 30 để có margin
   const tokenCache = new Map(); // email -> { token, fetchedAt }
 
-  async function getCachedOrFreshToken(email) {
+  async function getCachedOrFreshToken(email, { forceRefresh = false } = {}) {
     const cached = tokenCache.get(email);
-    if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) {
+    if (!forceRefresh && cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) {
       return { token: cached.token, cached: true };
     }
+    tokenCache.delete(email); // invalidate trước khi lấy mới
     const resp = await api.generate('auth.get-token-api', { username: email, password: DEFAULT_OTP_PASSWORD });
     const token = resp.result.data.accessToken;
     tokenCache.set(email, { token, fetchedAt: Date.now() });
@@ -381,26 +382,57 @@
    * show the right page ON LOAD when landing on that path, and keep
    * back/forward browser buttons working via popstate.
    */
+  // Danh sách các service pages (ngoài home)
+  const SERVICE_PAGES = ['ivoice', 'sm', 'mes', 'idc', 'll'];
+
   function showPageFor(pathname) {
-    const isIvoice = pathname === '/ivoice';
-    if (isIvoice) renderIvoicePage();
-    document.getElementById('home-hero').hidden = isIvoice;
-    document.getElementById('catalog').hidden = isIvoice;
-    document.getElementById('home-activity-log').hidden = isIvoice;
-    document.getElementById('ivoice-page').hidden = !isIvoice;
+    const active = SERVICE_PAGES.find(s => pathname === '/' + s) || null;
+    if (active === 'ivoice') renderIvoicePage();
+
+    // Hiện/ẩn home
+    const isHome = !active;
+    document.getElementById('home-hero').hidden = !isHome;
+    document.getElementById('catalog').hidden = !isHome;
+    document.getElementById('home-activity-log').hidden = !isHome;
+
+    // Hiện/ẩn từng service page
+    SERVICE_PAGES.forEach(s => {
+      const el = document.getElementById(s + '-page');
+      if (el) el.hidden = (active !== s);
+    });
+
+    // Active state cho nav links
+    SERVICE_PAGES.forEach(s => {
+      const link = document.getElementById('nav-' + s);
+      if (link) link.classList.toggle('is-active', active === s);
+    });
   }
+
   function navigateTo(pathname) {
     if (location.pathname !== pathname) history.pushState({}, '', pathname);
     showPageFor(pathname);
     window.scrollTo(0, 0);
   }
-  function goToIvoicePage() { navigateTo('/ivoice'); }
+
   function goToHomePage() { navigateTo('/'); }
-  document.getElementById('nav-ivoice').addEventListener('click', (e) => { e.preventDefault(); goToIvoicePage(); });
+
+  // Nav links
+  SERVICE_PAGES.forEach(s => {
+    const link = document.getElementById('nav-' + s);
+    if (link) link.addEventListener('click', (e) => { e.preventDefault(); navigateTo('/' + s); });
+  });
   document.getElementById('nav-home').addEventListener('click', (e) => { e.preventDefault(); goToHomePage(); });
-  document.getElementById('ivoice-back').addEventListener('click', (e) => { e.preventDefault(); goToHomePage(); });
+
+  // Back links từ mỗi service page
+  document.querySelectorAll('.service-back').forEach(el => {
+    el.addEventListener('click', (e) => { e.preventDefault(); goToHomePage(); });
+  });
+  // legacy ivoice-back (vẫn giữ để không break)
+  const ivoiceBack = document.getElementById('ivoice-back');
+  if (ivoiceBack) ivoiceBack.addEventListener('click', (e) => { e.preventDefault(); goToHomePage(); });
+
   window.addEventListener('popstate', () => showPageFor(location.pathname));
-  showPageFor(location.pathname); // land directly on /ivoice (e.g. reload) shows the right page immediately
+  showPageFor(location.pathname);
 
   // Fixed lookup identity for registration.lookup — any authenticated BMS
   // account can run that search regardless of assignment (confirmed live
@@ -551,7 +583,7 @@
     if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) {
       return { cookieHeader: cached.cookieHeader, cached: true };
     }
-    const resp = await api.generate('auth.get-ivoice-session', { username: email, password: DEFAULT_OTP_PASSWORD });
+    const resp = await api.generate('auth.get-ivoice-session-api', { username: email, password: DEFAULT_OTP_PASSWORD });
     const cookieHeader = resp.result.data.cookieHeader;
     ivoiceSessionCache.set(email, { cookieHeader, fetchedAt: Date.now() });
     return { cookieHeader, cached: false };
@@ -582,7 +614,10 @@
     if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) {
       return { cookieHeader: cached.cookieHeader, cached: true };
     }
-    const resp = await api.generate('auth.get-bms-legacy-session', { username: email, password: DEFAULT_OTP_PASSWORD, refCode });
+    // Dùng pure API (auth.get-bms-legacy-session-api) — visit CreateRegist 2 lần:
+    // lần 1 để lấy FTIBMS-Auth, lần 2 để server set FTIBMS + jwt_token_id.
+    // InsertRegistration cần đủ cả 3 cookies — Selenium chỉ poll đến FTIBMS-Auth nên thiếu 2 còn lại → 401.
+    const resp = await api.generate('auth.get-bms-legacy-session-api', { username: email, password: DEFAULT_OTP_PASSWORD, refCode });
     const cookieHeader = resp.result.data.cookieHeader;
     bmsLegacySessionCache.set(cacheKey, { cookieHeader, fetchedAt: Date.now() });
     return { cookieHeader, cached: false };
@@ -703,16 +738,30 @@
       }
       oppLookupStatus.classList.remove('is-error');
       oppLookupStatus.textContent = `⏳ Đang tra cứu ${opportunityCode}…`;
+      const doLookup = async (forceRefresh = false) => {
+        const { token } = await getCachedOrFreshToken(saleEmail, { forceRefresh });
+        return api.generate('ivoice.lookup-opportunity', { bearerToken: token, opportunityCode });
+      };
       try {
-        const { token } = await getCachedOrFreshToken(saleEmail);
-        const resp = await api.generate('ivoice.lookup-opportunity', { bearerToken: token, opportunityCode });
+        let resp;
+        try {
+          resp = await doLookup(false);
+        } catch (err) {
+          // 401 → token hết hạn — clear cache và retry với token mới
+          if (err.message && (err.message.includes('401') || err.message.includes('Unauthorized'))) {
+            oppLookupStatus.textContent = `⏳ Token hết hạn, đang lấy lại…`;
+            resp = await doLookup(true); // forceRefresh = true
+          } else {
+            throw err;
+          }
+        }
         const d = resp.result.data;
         customerIdInput.value = d.customerId;
         registrationIdInput.value = d.registrationId;
         refCodeInput.value = d.refCode;
         taxIdInput.value = d.taxId;
         oppLookupStatus.textContent = `✓ RefCode=${d.refCode}, KH=${d.customerId}, Mã số thuế=${d.taxId}`;
-        onIdentityChange(); // customerId/refCode/taxId just got set programmatically — no native 'change' event fires for that, so trigger explicitly
+        onIdentityChange();
       } catch (err) {
         oppLookupStatus.textContent = '✗ Tra cứu lỗi: ' + (err.message || err);
         oppLookupStatus.classList.add('is-error');
@@ -1279,13 +1328,23 @@
             });
             const response = resp.result.data.response;
             if (looksLikeFailureResponse(response)) {
-              // Server trả HTTP 200 nhưng body là lỗi nghiệp vụ (VD: RefCode
-              // này đã có phiếu triển khai / đã submit rồi) — user report
-              // 2026-09-07: UI từng hiện nhầm ✓ cho case này vì chỉ check
-              // HTTP status, không đọc field code/status bên trong response.
-              step1Line.textContent = `✗ [1/3] Thêm chi tiết THẤT BẠI (server trả lỗi nghiệp vụ, không phải lỗi mạng) — ${responseFailureMessage(response)} — response: ${JSON.stringify(response)}`;
-              step1Line.classList.add('is-error');
-              UI.toast('error', 'Thêm chi tiết thất bại: ' + responseFailureMessage(response));
+              const msg = responseFailureMessage(response);
+              // Case đặc biệt: số điện thoại đã được đăng ký cho chính cơ hội này
+              // từ lần chạy trước (bước 1 đã thành công trước đó, bước 2 bị lỗi).
+              // Detect bằng "thuộc mã cơ hội: <opportunityCode>" trong message.
+              // Unicode normalize trước khi so sánh — server trả NFD, source JS dùng NFC,
+              // nên msg.includes('thuộc mã cơ hội') bị false dù nhìn giống nhau.
+              const msgNFC = msg.normalize('NFC');
+              const alreadyRegisteredForThisOpp =
+                msgNFC.includes('thuộc mã cơ hội') && msg.includes(opportunityCode);
+              if (alreadyRegisteredForThisOpp) {
+                step1Line.textContent = `⚠️ [1/3] Thêm chi tiết đã chạy trước đó (số điện thoại đã thuộc cơ hội này) — bỏ qua, tiếp tục Bước 2 "Tạo"…`;
+                step1Ok = true; // treat as already done, continue to step 2
+              } else {
+                step1Line.textContent = `✗ [1/3] Thêm chi tiết THẤT BẠI (server trả lỗi nghiệp vụ, không phải lỗi mạng) — ${msg} — response: ${JSON.stringify(response)}`;
+                step1Line.classList.add('is-error');
+                UI.toast('error', 'Thêm chi tiết thất bại: ' + msg);
+              }
             } else {
               step1Line.textContent = `✓ [1/3] Thêm chi tiết xong — response: ${JSON.stringify(response)}`;
               step1Ok = true;
@@ -1893,8 +1952,8 @@
         <td style="padding:5px 10px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(p.customerName || '')}">${escapeHtml(p.customerName || '')}</td>
         <td style="padding:5px 10px;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(svcs)}">${escapeHtml(svcs)}</td>
         <td style="padding:5px 10px;">${escapeHtml(p.stopAfter || '')}</td>
-        <td style="padding:5px 10px;font-weight:600;color:${e.success ? '#16a34a' : '#dc2626'};">
-          ${e.success ? '✓' : '✗'} ${escapeHtml(e.summary || '')}
+        <td style="padding:5px 10px;font-weight:600;color:${e.success ? '#16a34a' : '#dc2626'};max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${escapeHtml(e.summary || '')}">
+          ${e.success ? '✓' : '✗'} ${escapeHtml((e.summary || '').length > 60 ? e.summary.substring(0, 60) + '…' : (e.summary || ''))}
         </td>
         <td style="padding:5px 10px;text-align:right;">${e.durationMs ? (e.durationMs / 1000).toFixed(1) + 's' : ''}</td>
       `;

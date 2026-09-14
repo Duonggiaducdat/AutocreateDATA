@@ -33,7 +33,11 @@
         </span>
       </a>
       <div class="d-flex align-items-center gap-3 ms-3">
-        <a id="nav-ivoice" href="#" class="nav-page-link">Ivoice</a>
+        <a id="nav-ivoice" href="/ivoice" class="nav-page-link">IVOICE</a>
+        <a id="nav-sm"     href="/sm"     class="nav-page-link">SM</a>
+        <a id="nav-mes"    href="/mes"    class="nav-page-link">MES</a>
+        <a id="nav-idc"    href="/idc"    class="nav-page-link">IDC</a>
+        <a id="nav-ll"     href="/ll"     class="nav-page-link">LL</a>
       </div>
       <div class="ms-auto d-flex align-items-center gap-2">
         <input id="search" type="search" class="form-control form-control-sm app-search"
@@ -51,18 +55,41 @@
     <div id="ivoice-page-host"></div>
   </main>
 
+  <!-- ============== SM PAGE ============== -->
+  <main id="sm-page" class="container-xl pt-5 pb-5" hidden>
+    <a href="/" class="nav-page-link service-back">← Trang chính</a>
+    <div class="eyebrow" style="margin-top:1rem;">Dịch vụ SM · login: sm/v2</div>
+    <h1 class="display-1 hero-title mb-4">SM</h1>
+    <div id="sm-page-host"></div>
+  </main>
+
+  <!-- ============== MES PAGE ============== -->
+  <main id="mes-page" class="container-xl pt-5 pb-5" hidden>
+    <a href="/" class="nav-page-link service-back">← Trang chính</a>
+    <div class="eyebrow" style="margin-top:1rem;">Dịch vụ MES · login: sm/v2</div>
+    <h1 class="display-1 hero-title mb-4">MES</h1>
+    <div id="mes-page-host"></div>
+  </main>
+
+  <!-- ============== IDC PAGE ============== -->
+  <main id="idc-page" class="container-xl pt-5 pb-5" hidden>
+    <a href="/" class="nav-page-link service-back">← Trang chính</a>
+    <div class="eyebrow" style="margin-top:1rem;">Dịch vụ IDC · login: apis-stag/idc</div>
+    <h1 class="display-1 hero-title mb-4">IDC</h1>
+    <div id="idc-page-host"></div>
+  </main>
+
+  <!-- ============== LL PAGE ============== -->
+  <main id="ll-page" class="container-xl pt-5 pb-5" hidden>
+    <a href="/" class="nav-page-link service-back">← Trang chính</a>
+    <div class="eyebrow" style="margin-top:1rem;">Dịch vụ LL · login: /ll session cookie</div>
+    <h1 class="display-1 hero-title mb-4">LL</h1>
+    <div id="ll-page-host"></div>
+  </main>
+
   <!-- ============== HERO ============== -->
-  <header id="home-hero" class="container-xl pt-5 pb-4">
-    <div class="eyebrow">FTMS Test Data Generator · Pure API</div>
-    <h1 class="display-1 hero-title mb-3">
-      One card per generator. <em>Every parameter</em>, exposed.
-    </h1>
-    <p class="hero-lead">
-      Each card is rendered from a backend-served catalog
-      (<code>GET&nbsp;/api/generators</code>). Click <strong>Generate</strong> and the form is
-      <code>POST</code>ed to <code>/api/generate</code> — no UI logic is hardcoded.
-    </p>
-    <div id="categories" class="category-row mt-3"></div>
+  <header id="home-hero" class="container-xl pt-4 pb-2">
+    <div id="categories" class="category-row"></div>
   </header>
 
   <!-- ============== TOAST CONTAINER ============== -->

@@ -63,7 +63,8 @@ code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
   font-size: 13px; font-weight: 600; color: var(--ink-300); text-decoration: none;
   padding: 4px 2px; border-bottom: 2px solid transparent;
 }
-.nav-page-link:hover { color: var(--lime-400); border-bottom-color: var(--lime-400); }
+.nav-page-link:hover  { color: var(--lime-400); border-bottom-color: var(--lime-400); }
+.nav-page-link.is-active { color: var(--lime-400); border-bottom-color: var(--lime-400); }
 .app-search {
   background: var(--ink-900); border: 1px solid var(--ink-700); color: var(--ink-100);
   font-family: 'JetBrains Mono', monospace; font-size: 12px; min-width: 260px;

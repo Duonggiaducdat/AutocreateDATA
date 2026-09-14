@@ -89,8 +89,19 @@ public class GetBmsLegacySessionGenerator extends AbstractGenerator {
         trace(log, "login(" + username + ") via Selenium, then warm up BMS legacy session");
 
         String cookieHeader = automation.computeWithDriver(driver -> {
-            new LoginPage(driver).login(username, password);
-            driver.get(LEGACY_CREATE_REGIST_URL + refCode);
+            // Navigate thẳng vào CreateRegist (không qua OppsMagt/Create đã redirect sang bmsv2).
+            // Fresh browser session → không có bmsv2 cookies → server redirect sang CAS login.
+            // Sau CAS login, server redirect về CreateRegist với đủ FTIBMS-Auth + FTIBMS + jwt_token_id.
+            LoginPage page = new LoginPage(driver);
+            page.openUrl(LEGACY_CREATE_REGIST_URL + refCode);
+            page.click(org.openqa.selenium.By.xpath("//p[text()='Sử dụng mật khẩu một lần (OTP)']"));
+            page.sendKeys(org.openqa.selenium.By.id("username"), username);
+            page.click(org.openqa.selenium.By.xpath("//button[text()='TIẾP THEO']"));
+            page.sendKeys(org.openqa.selenium.By.xpath("//input[@type=\"password\"]"), password);
+            page.click(org.openqa.selenium.By.xpath("//button[text()='ĐĂNG NHẬP']"));
+            page.waitForPageLoaded();
+            page.sleep(3);
+
             for (int i = 0; i < POLL_ATTEMPTS; i++) {
                 boolean hasLegacyCookie = driver.manage().getCookies().stream()
                         .anyMatch(c -> c.getName().equals(LEGACY_COOKIE_NAME));
