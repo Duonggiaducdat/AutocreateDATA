@@ -138,12 +138,17 @@ public class LookupOpportunityForIvoiceGenerator implements Generator {
             throw new GeneratorException("Khách hàng " + customerId + " không có taxOrHouseholdCode lẫn identity — không suy ra được Mã số thuế");
         }
 
+        // saleName từ approval.saleName (AM của cơ hội) — giúp UI auto-fill
+        // "Tài khoản Sale" khỏi nhập tay, thay vì chỉ dùng account xác thực.
+        String saleName = opp.path("approval").path("saleName").asText(null);
+
         return GenerationResult.builder(type())
                 .put("opportunityCode", opportunityCode)
                 .put("customerId", customerId)
                 .put("registrationId", registrationId)
                 .put("refCode", refCode)
                 .put("taxId", taxId)
+                .put("saleName", saleName)
                 .log(log)
                 .durationMs(System.currentTimeMillis() - t0)
                 .build();

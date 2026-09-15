@@ -623,6 +623,26 @@
     return { cookieHeader, cached: false };
   }
 
+  const smTokenCache = new Map(); // email -> { token, fetchedAt }
+  async function getCachedOrFreshSmToken(email) {
+    const cached = smTokenCache.get(email);
+    if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) return { token: cached.token, cached: true };
+    const resp = await api.generate('auth.get-sm-token-api', { username: email, password: DEFAULT_OTP_PASSWORD });
+    const token = resp.result.data.accessToken;
+    smTokenCache.set(email, { token, fetchedAt: Date.now() });
+    return { token, cached: false };
+  }
+
+  const newCmTokenCache = new Map(); // email -> { token, fetchedAt }
+  async function getCachedOrFreshNewCmToken(email) {
+    const cached = newCmTokenCache.get(email);
+    if (cached && (Date.now() - cached.fetchedAt) < TOKEN_CACHE_TTL_MS) return { token: cached.token, cached: true };
+    const resp = await api.generate('auth.get-new-cm-token', { username: email, password: DEFAULT_OTP_PASSWORD });
+    const token = resp.result.data.cmToken;
+    newCmTokenCache.set(email, { token, fetchedAt: Date.now() });
+    return { token, cached: false };
+  }
+
   /**
    * "Ivoice — Tạo yêu cầu HĐ/PL" — MỘT form duy nhất (user request
    * 2026-09-07: "bên dưới điền luôn trong 1 form luôn chứ vậy chi cho
@@ -684,7 +704,12 @@
         serviceType: '1',
         typeDocContract: '1', typeDocContractLabel: 'Hợp đồng',
       },
-      { value: '1800', label: '1800', supported: false },
+      {
+        value: '1800', label: '1800', supported: true,
+        serviceGroup: '1', serviceGroupLabel: 'Đầu số thoại',
+        serviceType: '2',
+        typeDocContract: '1', typeDocContractLabel: 'Hợp đồng',
+      },
       { value: '1900', label: '1900', supported: false },
       { value: 'cskh', label: 'CSKH', supported: false },
     ];
@@ -762,6 +787,10 @@
         taxIdInput.value = d.taxId;
         oppLookupStatus.textContent = `✓ RefCode=${d.refCode}, KH=${d.customerId}, Mã số thuế=${d.taxId}`;
         onIdentityChange();
+        // Auto-fetch serviceId cho 1800 (không chặn flow nếu lỗi)
+        if (currentServiceMeta()?.value === '1800' && d.registrationId) {
+          fetchServiceId1800(saleEmail, d.registrationId).catch(() => {});
+        }
       } catch (err) {
         oppLookupStatus.textContent = '✗ Tra cứu lỗi: ' + (err.message || err);
         oppLookupStatus.classList.add('is-error');
@@ -770,7 +799,15 @@
     saleInput.addEventListener('change', onIdentityChange);
     typeSelect.addEventListener('change', onIdentityChange);
 
-    const derivedSummary = UI.h('div', { class: 'hint' }, '');
+    const derivedSummary = UI.h('div', { class: 'hint', style: 'margin-top: 6px;' }, '');
+    const genClassEl = UI.h('span', { class: 'gen-class' }, '');
+    function updateGenClass() {
+      const meta = currentServiceMeta();
+      if (!meta || !meta.supported) { genClassEl.textContent = '—'; return; }
+      genClassEl.textContent = meta.value === '1800'
+        ? 'voice1800.insert-registration → approve-registration → cm-execute'
+        : 'ivoice.lookup-opportunity → ivoice.create-registration-detail → ivoice.insert-registration';
+    }
     function renderDerivedSummary() {
       const meta = currentServiceMeta();
       if (!meta) { derivedSummary.textContent = ''; return; }
@@ -781,6 +818,7 @@
         derivedSummary.classList.remove('is-error');
         derivedSummary.textContent = `Nhóm dịch vụ: ${meta.serviceGroupLabel} · Loại dịch vụ: ${meta.label} · Loại văn bản: ${meta.typeDocContractLabel}`;
       }
+      updateGenClass();
     }
     renderDerivedSummary();
 
@@ -1193,6 +1231,319 @@
       UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300);' },
         'Chưa hỗ trợ — chưa capture được payload cho loại dịch vụ này. Cần 1 lần "Copy as cURL" thật khi bấm Lưu trên UI (giống cách làm với Điện thoại cố định) để build tiếp.'));
 
+    // ── 1800 form ─────────────────────────────────────────────────────────────
+    const serviceId1800Input = UI.h('input', { class: 'app-input', type: 'number', value: '0',
+      placeholder: 'tự động lấy sau khi điền Mã cơ hội' });
+
+    // Auto-fetch serviceId từ GET /registration/{id} sau CH lookup
+    async function fetchServiceId1800(saleEmail, registrationId) {
+      try {
+        const { token } = await getCachedOrFreshToken(saleEmail);
+        const resp = await api.proxy('registration/' + registrationId, token);
+        const sid = resp?.data?.serviceId;
+        if (sid) { serviceId1800Input.value = String(sid); }
+      } catch (_) { /* silent */ }
+    }
+
+    // Đầu số 1800
+    let available1800Phones = [];
+    let selected1800Phone = null; // { phoneNumber, subcriberCharge }
+    const phone1800ListBody = UI.h('div', { class: 'phone-list-body' },
+      UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin: 0;' },
+        'Bấm "Tải đầu số" để xem danh sách số 1800 khả dụng.'));
+    const phone1800Status = UI.h('span', { class: 'hint' }, '');
+
+    function renderPhone1800List() {
+      phone1800ListBody.innerHTML = '';
+      if (available1800Phones.length === 0) {
+        phone1800ListBody.appendChild(UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin: 0;' },
+          'Không tìm thấy số 1800 nào khả dụng.'));
+        return;
+      }
+      available1800Phones.forEach((row) => {
+        const radio = UI.h('input', { type: 'radio', name: 'phone1800pick' });
+        if (selected1800Phone && selected1800Phone.phoneNumber === row.phoneNumber) radio.checked = true;
+        radio.addEventListener('change', () => {
+          selected1800Phone = { phoneNumber: row.phoneNumber, subcriberCharge: row.subcriberCharge || 0 };
+        });
+        const priceText = row.subcriberCharge != null
+          ? `${Number(row.subcriberCharge).toLocaleString('vi-VN')}đ/tháng` : '';
+        phone1800ListBody.appendChild(UI.h('label', {
+          class: 'd-flex align-items-center gap-2', style: 'padding: 3px 0; cursor: pointer;',
+        }, radio,
+          UI.h('span', { class: 'mono' }, row.phoneNumber || '(?)'),
+          UI.h('span', { class: 'hint' }, priceText)));
+      });
+      // Auto-select đầu tiên
+      if (!selected1800Phone && available1800Phones.length > 0) {
+        selected1800Phone = { phoneNumber: available1800Phones[0].phoneNumber,
+          subcriberCharge: available1800Phones[0].subcriberCharge || 0 };
+        phone1800ListBody.querySelector('input[type=radio]').checked = true;
+      }
+    }
+
+    const loadPhone1800Button = UI.h('button', {
+      type: 'button', class: 'btn-generate',
+      style: 'margin-top: 6px; padding: 6px 14px; font-size: 12px; width: auto;',
+      onclick: async () => {
+        const saleEmail = currentSaleEmail();
+        const taxId = taxIdInput.value.trim();
+        if (!saleEmail) { UI.toast('error', 'Điền Tài khoản Sale trước'); return; }
+        if (!taxId) { UI.toast('error', 'Cần Mã số thuế KH — điền Mã cơ hội trước để tự tra'); return; }
+        loadPhone1800Button.disabled = true;
+        phone1800Status.textContent = '⏳ Đang tải đầu số 1800…';
+        try {
+          const { token: smToken } = await getCachedOrFreshSmToken(saleEmail);
+          const resp = await api.generate('voice1800.get-phone-booked', {
+            smToken, taxId, locationId: locationSelect.value,
+          });
+          available1800Phones = resp.result.data.phones || [];
+          selected1800Phone = null;
+          renderPhone1800List();
+          phone1800Status.textContent = `✓ ${available1800Phones.length} số 1800 khả dụng`;
+        } catch (err) {
+          phone1800Status.textContent = '✗ ' + (err.message || err);
+          phone1800Status.classList.add('is-error');
+        } finally {
+          loadPhone1800Button.disabled = false;
+        }
+      },
+    }, 'Tải đầu số 1800');
+    locationSelect.addEventListener('change', () => {
+      available1800Phones = [];
+      selected1800Phone = null;
+      phone1800ListBody.innerHTML = '';
+      phone1800ListBody.appendChild(UI.h('p', { class: 'gen-signature', style: 'color: var(--ink-300); margin: 0;' },
+        'Đã đổi vùng miền — bấm "Tải đầu số" lại.'));
+    });
+    const districtId1800Input = UI.h('input', { class: 'app-input', type: 'number', value: '0',
+      placeholder: 'vd: 1000009799 — ward-id của địa chỉ thanh toán' });
+    const billing1800Name = UI.h('input', { class: 'app-input', type: 'text', value: randVnName() });
+    const billing1800Phone = UI.h('input', { class: 'app-input', type: 'text', value: randVnPhone() });
+    const billing1800Email = UI.h('input', { class: 'app-input', type: 'email', placeholder: 'để trống → dùng email Sale' });
+    const tech1800Name = UI.h('input', { class: 'app-input', type: 'text', value: randVnName() });
+    const tech1800Phone = UI.h('input', { class: 'app-input', type: 'text', value: randVnPhone() });
+    const tech1800Email = UI.h('input', { class: 'app-input', type: 'email', placeholder: 'để trống → dùng email Sale' });
+    const effectiveDate1800 = UI.h('input', { class: 'app-input', type: 'text',
+      value: (() => { const d = new Date(Date.now() - 86400000); return d.toISOString().substring(0, 10); })() });
+    const portMain1800 = UI.h('input', { class: 'app-input', type: 'text', value: '5060' });
+    const voiceDir1800 = UI.h('input', { class: 'app-input', type: 'text', value: '1,2',
+      placeholder: '1=Nội hạt, 2=Liên tỉnh, 3=Di động' });
+    const maxCall1800 = UI.h('input', { class: 'app-input', type: 'number', value: '4' });
+    const maxValue1800 = UI.h('input', { class: 'app-input', type: 'number', value: '2000000' });
+    const status1800 = UI.h('div', { class: 'gen-log' });
+    const autoApprove1800 = UI.h('input', { type: 'checkbox' });
+    const cmApprover1800 = UI.h('input', {
+      class: 'app-input', type: 'text', value: 'ThiTLH', style: 'width: auto;',
+    });
+
+    function addLine1800() {
+      const p = UI.h('p', { class: 'log-line' });
+      status1800.appendChild(p);
+      return p;
+    }
+
+    async function run1800AutoApprove(bmsToken, opportunityId) {
+      const approveLine = addLine1800();
+      approveLine.textContent = `⏳ BGĐ TTKD duyệt YCHD 1800 (${opportunityId})…`;
+      let regCodes = [];
+      try {
+        const resp = await api.generate('voice1800.approve-registration', { bearerToken: bmsToken, opportunityId });
+        regCodes = resp.result.data.regCodes || [];
+        approveLine.textContent = `✓ BGĐ duyệt xong · regCodes: ${regCodes.join(', ')}`;
+      } catch (err) {
+        approveLine.textContent = '✗ BGĐ duyệt lỗi: ' + (err.message || err);
+        approveLine.classList.add('is-error');
+        return;
+      }
+      if (regCodes.length === 0) {
+        addLine1800().textContent = '⚠ Không tìm được regCode — dừng trước bước CM';
+        return;
+      }
+      const cmEmail = toLoginEmail(cmApprover1800.value.trim());
+      const cmLine = addLine1800();
+      cmLine.textContent = `⏳ Lấy new-CM token (${cmEmail})…`;
+      let cmToken;
+      try {
+        const { token, cached } = await getCachedOrFreshNewCmToken(cmEmail);
+        cmToken = token;
+        cmLine.textContent = cached ? `✓ Dùng lại new-CM token (${cmEmail})` : `✓ new-CM token OK`;
+      } catch (err) {
+        cmLine.textContent = '✗ Lấy new-CM token lỗi: ' + (err.message || err);
+        cmLine.classList.add('is-error');
+        return;
+      }
+      for (const regCode of regCodes) {
+        const line = addLine1800();
+        line.textContent = `⏳ CM thực hiện + ghi nhận ${regCode}…`;
+        try {
+          const resp = await api.generate('voice1800.cm-execute', { cmToken, regCode });
+          const d = resp.result.data;
+          line.textContent = d.skipped
+            ? `✓ ${regCode} đã hoàn thành (HĐ ${d.contractNo || '?'})`
+            : `✓ ${regCode} CM xong — HĐ ${d.contractNo || '?'}`;
+        } catch (err) {
+          line.textContent = `✗ CM lỗi ${regCode}: ` + (err.message || err);
+          line.classList.add('is-error');
+        }
+      }
+    }
+
+    const submit1800Button = UI.h('button', {
+      class: 'btn-generate', type: 'button',
+      onclick: async () => {
+        status1800.innerHTML = '';
+        const saleEmail = currentSaleEmail();
+        const opportunityId = opportunityCodeInput.value.trim();
+        const registrationId = parseInt(registrationIdInput.value, 10);
+        const taxId = taxIdInput.value.trim();
+        const serviceId = parseInt(serviceId1800Input.value, 10);
+        const districtId = parseInt(districtId1800Input.value, 10);
+        if (!saleEmail || !opportunityId || !registrationId) {
+          addLine1800().textContent = '✗ Điền Tài khoản Sale + Mã cơ hội (đợi tra cứu tự động xong)';
+          return;
+        }
+        if (!serviceId) {
+          addLine1800().textContent = '✗ Điền Service ID (lấy từ GET /bms-service/api/registration/{id} → .data.serviceId)';
+          return;
+        }
+        if (!districtId) {
+          addLine1800().textContent = '✗ Điền District ID cho địa chỉ thanh toán (vd: 1000009799)';
+          return;
+        }
+        if (!wardSelect.value) {
+          addLine1800().textContent = '✗ Chưa chọn Phường/Xã triển khai — tải danh sách rồi chọn';
+          return;
+        }
+        if (!selected1800Phone) {
+          addLine1800().textContent = '✗ Chưa chọn đầu số 1800 — bấm "Tải đầu số 1800" rồi chọn 1 số';
+          return;
+        }
+        submit1800Button.disabled = true;
+        try {
+          const bmsLine = addLine1800();
+          bmsLine.textContent = `⏳ Lấy BMS token (${saleEmail})…`;
+          const { token: bmsToken, cached: bmsCached } = await getCachedOrFreshToken(saleEmail);
+          bmsLine.textContent = bmsCached ? `✓ Dùng lại BMS token` : `✓ BMS token OK`;
+
+          const smLine = addLine1800();
+          smLine.textContent = `⏳ Lấy SM token (${saleEmail})…`;
+          const { token: smToken, cached: smCached } = await getCachedOrFreshSmToken(saleEmail);
+          smLine.textContent = smCached ? `✓ Dùng lại SM token` : `✓ SM token OK`;
+
+          const insertLine = addLine1800();
+          insertLine.textContent = `⏳ Tạo YCHD 1800 cho ${opportunityId} (registrationId=${registrationId})…`;
+          const deployDateVal = (() => {
+            const d = deployDateInput.value.trim();
+            const m = d.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+            return m ? `${m[3]}-${m[1]}-${m[2]}` : d;
+          })();
+          const resp = await api.generate('voice1800.insert-registration', {
+            bmsToken, smToken,
+            opportunityId, registrationId, taxId, serviceId,
+            saleName: saleInput.value.trim(),
+            locationId: locationSelect.value,
+            locationName: locationSelect.selectedOptions[0].textContent,
+            wardId: parseInt(wardSelect.value, 10),
+            wardName: wardSelect.selectedOptions[0] ? wardSelect.selectedOptions[0].textContent : '',
+            districtId,
+            locationNumber: locationNumberInput.value.trim(),
+            deployDate: deployDateVal,
+            contactName: contactNameInput.value.trim(),
+            contactPhone: contactPhoneInput.value.trim(),
+            contactEmail: contactEmailInput.value.trim(),
+            billingName: billing1800Name.value.trim(),
+            billingEmail: billing1800Email.value.trim() || saleEmail,
+            billingPhone: billing1800Phone.value.trim(),
+            techName: tech1800Name.value.trim(),
+            techEmail: tech1800Email.value.trim() || saleEmail,
+            techPhone: tech1800Phone.value.trim(),
+            feeContract: parseInt(feeContractInput.value, 10) || 0,
+            monthlyFeeContract: parseInt(monthlyFeeContractInput.value, 10) || 0,
+            dateContractMonth: parseInt(dateContractMonthInput.value, 10) || 1,
+            limitCreditDay: parseInt(limitCreditDayInput.value, 10) || 30,
+            effectiveDate: effectiveDate1800.value.trim(),
+            ipMain: ipMainInput.value.trim(),
+            portMain: portMain1800.value.trim(),
+            voiceDirectionOpen: voiceDir1800.value.trim(),
+            maxCall: parseInt(maxCall1800.value, 10) || 4,
+            maxValue: parseInt(maxValue1800.value, 10) || 2000000,
+            selectedPhoneNumber: selected1800Phone.phoneNumber,
+            selectedPhoneCharge: selected1800Phone.subcriberCharge,
+          });
+          const d = resp.result.data;
+          insertLine.textContent = `✓ YCHD 1800 tạo xong — số ${d.phoneNumber} · ${d.status}`;
+          UI.toast('success', `Tạo YCHD 1800 ✓ — ${d.phoneNumber}`);
+          if (autoApprove1800.checked) {
+            await run1800AutoApprove(bmsToken, opportunityId);
+          }
+        } catch (err) {
+          const l = addLine1800();
+          l.textContent = '✗ Lỗi: ' + (err.message || err);
+          l.classList.add('is-error');
+          UI.toast('error', 'Tạo YCHD 1800 lỗi: ' + (err.message || err));
+        } finally {
+          submit1800Button.disabled = false;
+        }
+      },
+    }, 'Tạo YCHD 1800');
+
+    const form1800Body = UI.h('div', { class: 'gen-body' },
+      UI.h('div', { class: 'field-grid-3' },
+        field('Service ID', serviceId1800Input, 'GET /registration/{id} → .data.serviceId'),
+        field('Phân loại HĐ (TypeContract)', typeContractCategoryInput),
+        field('Vùng miền / Tỉnh thành', locationSelect),
+        field('Cước trả một lần (VNĐ)', feeContractInput),
+        field('Cước tháng (VNĐ)', monthlyFeeContractInput),
+        field('Kỳ hạn TT (tháng)', dateContractMonthInput),
+        field('Hạn mức công nợ (ngày)', limitCreditDayInput),
+        field('Ngày hiệu lực HĐ (YYYY-MM-DD)', effectiveDate1800)),
+      UI.h('div', { class: 'field-grid-3' },
+        UI.h('label', { class: 'd-block' },
+          UI.h('div', { class: 'field-label' }, UI.h('span', { class: 'lbl' }, 'Phường/Xã triển khai')),
+          wardSelect,
+          UI.h('div', { style: 'margin-top: 6px;' }, loadWardsButton, ' ', wardStatus)),
+        field('District ID (địa chỉ thanh toán)', districtId1800Input, 'ward-id của billing address — vd: 1000009799'),
+        field('Số nhà, tên đường', locationNumberInput),
+        field('Người liên hệ triển khai', contactNameInput),
+        field('SĐT liên hệ TK', contactPhoneInput),
+        field('Email liên hệ TK', contactEmailInput),
+        field('Ngày hẹn triển khai (MM/DD/YYYY)', deployDateInput)),
+      UI.h('label', { class: 'd-block' },
+        UI.h('div', { class: 'field-label' },
+          UI.h('span', { class: 'lbl' }, 'Đầu số 1800'),
+          phone1800Status),
+        UI.h('div', { style: 'margin-top: 6px;' }, loadPhone1800Button),
+        UI.h('div', { style: 'margin-top: 8px;' }, phone1800ListBody)),
+      UI.h('fieldset', { style: 'border: 1px solid var(--ink-700); border-radius: 4px; padding: 10px; margin: 8px 0;' },
+        UI.h('legend', { class: 'hint', style: 'padding: 0 6px;' }, 'Liên hệ thu cước'),
+        UI.h('div', { class: 'field-grid-3' },
+          field('Tên', billing1800Name),
+          field('SĐT', billing1800Phone),
+          field('Email', billing1800Email))),
+      UI.h('fieldset', { style: 'border: 1px solid var(--ink-700); border-radius: 4px; padding: 10px; margin: 8px 0;' },
+        UI.h('legend', { class: 'hint', style: 'padding: 0 6px;' }, 'Liên hệ kỹ thuật'),
+        UI.h('div', { class: 'field-grid-3' },
+          field('Tên', tech1800Name),
+          field('SĐT', tech1800Phone),
+          field('Email', tech1800Email))),
+      UI.h('fieldset', { style: 'border: 1px solid var(--ink-700); border-radius: 4px; padding: 10px; margin: 8px 0;' },
+        UI.h('legend', { class: 'hint', style: 'padding: 0 6px;' }, 'Cấu hình đường truyền SIP'),
+        UI.h('div', { class: 'field-grid-3' },
+          field('IP kết nối', ipMainInput),
+          field('Port SIP', portMain1800),
+          field('Hướng cuộc gọi (mã phân cách ,)', voiceDir1800),
+          field('Số CG tối đa', maxCall1800),
+          field('Hạn mức sử dụng (VNĐ)', maxValue1800))),
+      UI.h('label', { class: 'd-flex align-items-center gap-2', style: 'padding: 10px 0; border-top: 1px solid var(--ink-700); margin-top: 6px;' },
+        autoApprove1800,
+        UI.h('span', { class: 'lbl' }, 'Tự động BGĐ duyệt + CM ghi nhận sau khi tạo xong'),
+        UI.h('span', { class: 'hint' }, '— hành động thật, mặc định tắt'),
+        UI.h('span', null, 'Tài khoản CM:'),
+        cmApprover1800),
+      status1800);
+    // ── end 1800 form ──────────────────────────────────────────────────────────
+
     const submitButton = UI.h('button', {
       class: 'btn-generate',
       type: 'button',
@@ -1359,17 +1710,19 @@
           // ----- Bước 2/2: bms.insert-registration (Bước 3 "Tạo", legacy BMS) -----
           // Cần đăng nhập LẠI (vùng legacy BMS riêng — session bước 1 ở
           // trên KHÔNG dùng chung được, xem javadoc GetBmsLegacySessionGenerator).
+          const bmsAdminEmail = toLoginEmail(cmApproverInput.value.trim());
           const loginLine = addLine();
-          loginLine.textContent = `⏳ Đăng nhập BMS legacy (${saleEmail})…`;
+          loginLine.textContent = `⏳ Đăng nhập BMS legacy (${bmsAdminEmail})…`;
           let bearerToken, bmsCookieHeader;
           try {
             const t = await getCachedOrFreshToken(saleEmail);
             bearerToken = t.token;
-            const c = await getCachedOrFreshBmsLegacySession(saleEmail, refCode);
+            await getCachedOrFreshToken(bmsAdminEmail); // warm TGT cho truongnv64 trước khi lấy BMS legacy session
+            const c = await getCachedOrFreshBmsLegacySession(bmsAdminEmail, refCode);
             bmsCookieHeader = c.cookieHeader;
             loginLine.textContent = c.cached
-              ? `✓ Dùng lại session BMS legacy (${saleEmail}, còn hạn)`
-              : `✓ Đăng nhập BMS legacy thành công (${saleEmail})`;
+              ? `✓ Dùng lại session BMS legacy (${bmsAdminEmail}, còn hạn)`
+              : `✓ Đăng nhập BMS legacy thành công (${bmsAdminEmail})`;
           } catch (err) {
             loginLine.textContent = '✗ Đăng nhập BMS legacy lỗi: ' + (err.message || err);
             loginLine.classList.add('is-error');
@@ -1454,11 +1807,14 @@
       const meta = currentServiceMeta();
       body.innerHTML = '';
       footer.innerHTML = '';
-      if (meta && meta.supported) {
+      if (!meta || !meta.supported) {
+        body.appendChild(unsupportedBody);
+      } else if (meta.value === '1800') {
+        body.appendChild(form1800Body);
+        footer.appendChild(submit1800Button);
+      } else {
         body.appendChild(phoneFormBody);
         footer.appendChild(submitButton);
-      } else {
-        body.appendChild(unsupportedBody);
       }
     }
     renderBodyForType();
@@ -1476,21 +1832,27 @@
           opportunityCodeInput,
           UI.h('div', { style: 'margin-top: 4px;' }, oppLookupStatus))),
       UI.h('div', { class: 'field-grid-3' },
-        field('Loại dịch vụ (Đấu số thoại)', typeSelect),
         field('Mã khách hàng', customerIdInput, 'tự động lấy từ Mã cơ hội'),
         field('RefCode', refCodeInput, 'tự động lấy từ Mã cơ hội'),
         field('Mã số thuế KH', taxIdInput, 'tự động lấy từ Mã cơ hội')));
 
+    const typePickerBar = UI.h('div', {
+      class: 'gen-body',
+      style: 'border-bottom: 1px solid var(--ink-700); padding-bottom: 14px; margin-bottom: 0;',
+    },
+      field('Loại dịch vụ (Đầu số thoại)', typeSelect),
+      derivedSummary);
+
     return UI.h('article', { class: 'gen-card' },
+      typePickerBar,
       UI.h('header', { class: 'gen-header' },
         UI.h('div', { class: 'd-flex justify-content-between align-items-start gap-2' },
           UI.h('div', null,
             UI.h('div', { class: 'gen-eyebrow' }, UI.h('span', { class: 'dot' }), 'Opportunity'),
             UI.h('h3', { class: 'gen-title' }, 'Ivoice — Tạo yêu cầu HĐ/PL')),
-          UI.h('span', { class: 'gen-class' }, 'ivoice.lookup-opportunity → ivoice.create-registration-detail → ivoice.insert-registration')),
+          genClassEl),
         UI.h('p', { class: 'gen-signature' },
-          '✅ Đã xác nhận chạy thật thành công 2026-09-07 (CH00085411) — 1 nút chạy tuần tự Thêm chi tiết (IVOICE) rồi đến Bước 3 "Tạo" (BMS legacy, đẩy sang "Chờ BGĐ duyệt"), log hiện response thô của cả 2. Cần RegistrationId đã tồn tại sẵn (bước "Xác nhận tạo yêu cầu hợp đồng" vẫn thao tác tay).'),
-        UI.h('div', { style: 'margin-top: 6px;' }, derivedSummary)),
+          '✅ Đã xác nhận: Điện thoại cố định (2026-09-07 · CH00085411), 1800 (2026-09-15 · CH00085565). Cần RegistrationId đã tồn tại sẵn (bước "Xác nhận tạo yêu cầu hợp đồng" vẫn thao tác tay).')),
       identityBody,
       body,
       footer);
