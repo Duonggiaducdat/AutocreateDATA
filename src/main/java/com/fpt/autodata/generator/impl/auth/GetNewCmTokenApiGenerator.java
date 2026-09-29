@@ -8,13 +8,18 @@ import com.fpt.autodata.generator.GenerationResult;
 import com.fpt.autodata.generator.GeneratorException;
 import com.fpt.autodata.generator.ParamSpec;
 import com.fpt.autodata.generator.Params;
+import com.fpt.autodata.selenium.LoginPage;
+import com.fpt.autodata.service.automation.FtmsAutomation;
+import org.openqa.selenium.JavascriptExecutor;
 import org.springframework.stereotype.Component;
 
 import java.net.CookieManager;
 import java.net.URI;
+import java.net.URLEncoder;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -54,15 +59,18 @@ public class GetNewCmTokenApiGenerator implements Generator {
     private static final String NEW_CM_SERVICE_ENCODED = "https%3A%2F%2Fftms-stag.fpt.net%2Fnew-cm";
     private static final String CAS_URL  = FTMS_BASE + "/id/login?service=" + NEW_CM_SERVICE;
     private static final String SSO_URL  = "https://ftisapi-stag.fpt.net/api/cm/auth/sso";
-    private static final Pattern TICKET_PAT = Pattern.compile("[?&]ticket=(ST-[^&\\s\\r\\n]+)");
+    private static final Pattern TICKET_PAT    = Pattern.compile("[?&]ticket=(ST-[^&\\s\\r\\n]+)");
+    private static final Pattern EXECUTION_PAT = Pattern.compile("name=\"execution\"\\s+value=\"([^\"]+)\"");
 
-    private final ObjectMapper mapper  = new ObjectMapper();
-    private final Duration     timeout;
-    private final CasTgtCache  tgtCache;
+    private final ObjectMapper   mapper     = new ObjectMapper();
+    private final Duration       timeout;
+    private final CasTgtCache    tgtCache;
+    private final FtmsAutomation automation;
 
-    public GetNewCmTokenApiGenerator(AutodataProperties props, CasTgtCache tgtCache) {
-        this.timeout  = Duration.ofSeconds(props.getApi().getTimeoutSeconds());
-        this.tgtCache = tgtCache;
+    public GetNewCmTokenApiGenerator(AutodataProperties props, CasTgtCache tgtCache, FtmsAutomation automation) {
+        this.timeout    = Duration.ofSeconds(props.getApi().getTimeoutSeconds());
+        this.tgtCache   = tgtCache;
+        this.automation = automation;
     }
 
     @Override public String type()        { return "auth.get-new-cm-token"; }
@@ -102,26 +110,95 @@ public class GetNewCmTokenApiGenerator implements Generator {
 
         // ── Step 1: GET CAS ticket cho new-cm service ──────────────────────
         String ticket = null;
+        String executionFromStep1 = null;
+        int step1Status = -1;
         try {
             HttpRequest req = HttpRequest.newBuilder()
                 .uri(URI.create(CAS_URL))
                 .timeout(timeout)
                 .header("User-Agent", "Mozilla/5.0")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                 .GET().build();
             HttpResponse<String> resp = clientWithCookies.send(req, HttpResponse.BodyHandlers.ofString());
+            step1Status = resp.statusCode();
             if (resp.statusCode() == 302) {
                 Matcher m = TICKET_PAT.matcher(resp.headers().firstValue("location").orElse(""));
                 if (m.find()) ticket = m.group(1);
+            } else if (resp.statusCode() == 200) {
+                // No TGT — parse execution token now so Step 1b GET is skipped
+                Matcher m = EXECUTION_PAT.matcher(resp.body());
+                if (m.find()) executionFromStep1 = m.group(1);
             }
         } catch (Exception e) {
             throw new GeneratorException("Step 1 GET CAS new-CM thất bại: " + e.getMessage(), e);
         }
 
+        // TGT chưa cache (hoặc auth.get-token-api dùng Selenium fallback không seed cache)
+        // → tự login CAS với password để lấy ticket và đồng thời seed TGT.
         if (ticket == null) {
-            throw new GeneratorException(
-                "Không lấy được CAS ticket cho new-CM. " +
-                "Hãy gọi auth.get-token-api trước để đăng nhập BMS và cache TGT. " +
-                "TGT từ BMS login được dùng lại cho new-CM service.");
+            String password = Params.optString(p, "password", "ISC22QC");
+            // Step 1b: chỉ GET lại nếu Step 1 chưa parse được execution token
+            // (e.g. Step 1 trả 200 nhưng body bị truncate hoặc không có execution field)
+            String execution = executionFromStep1 != null ? executionFromStep1 : "e1s1";
+            int step1bStatus = step1Status;
+            if (executionFromStep1 == null) {
+                try {
+                    HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(CAS_URL)).timeout(timeout)
+                        .header("User-Agent", "Mozilla/5.0")
+                        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                        .GET().build();
+                    HttpResponse<String> r = clientWithCookies.send(req, HttpResponse.BodyHandlers.ofString());
+                    step1bStatus = r.statusCode();
+                    if (r.statusCode() == 302) {
+                        // TGT vừa xuất hiện (race) — thử lấy ticket từ redirect
+                        Matcher m = TICKET_PAT.matcher(r.headers().firstValue("location").orElse(""));
+                        if (m.find()) ticket = m.group(1);
+                    } else if (r.statusCode() == 200) {
+                        Matcher m = EXECUTION_PAT.matcher(r.body());
+                        if (m.find()) execution = m.group(1);
+                    }
+                } catch (Exception ignored) { /* dùng default e1s1 */ }
+            }
+
+            if (ticket == null) {
+                // Step 2b: POST credentials — CookieManager tự lưu TGT Set-Cookie
+                String formBody = "username=" + URLEncoder.encode(username, StandardCharsets.UTF_8)
+                    + "&password=" + URLEncoder.encode(password, StandardCharsets.UTF_8)
+                    + "&execution=" + URLEncoder.encode(execution, StandardCharsets.UTF_8)
+                    + "&_eventId=submit&language=vi&countLogin=0&hasError=0&errorMsg=";
+                int step2bStatus = -1;
+                String step2bLocation = "";
+                try {
+                    HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(CAS_URL)).timeout(timeout)
+                        .header("Content-Type", "application/x-www-form-urlencoded")
+                        .header("User-Agent", "Mozilla/5.0").header("Referer", CAS_URL)
+                        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                        .POST(HttpRequest.BodyPublishers.ofString(formBody)).build();
+                    HttpResponse<String> r = clientWithCookies.send(req, HttpResponse.BodyHandlers.ofString());
+                    step2bStatus = r.statusCode();
+                    step2bLocation = r.headers().firstValue("location").orElse("");
+                    if (r.statusCode() == 302) {
+                        Matcher m = TICKET_PAT.matcher(step2bLocation);
+                        if (m.find()) ticket = m.group(1);
+                    }
+                } catch (Exception e) {
+                    throw new GeneratorException("CAS POST cho new-CM thất bại: " + e.getMessage(), e);
+                }
+                if (ticket == null) {
+                    tgtCache.invalidate(username);
+                    if (step2bStatus == 401) {
+                        // Rate-limited → Selenium fallback (browser không bị rate-limit như HTTP client)
+                        return loginViaSeleniumForNewCm(username, password, t0);
+                    }
+                    throw new GeneratorException(
+                        "Không lấy được CAS ticket sau khi thử full login cho new-CM. " +
+                        "Step1 HTTP=" + step1Status + " Step1b HTTP=" + step1bStatus + " execution=" + execution +
+                        " | Step2b HTTP=" + step2bStatus + " location=[" + step2bLocation + "]" +
+                        " | username=" + username);
+                }
+            }
         }
 
         // ── Step 2: POST /api/cm/auth/sso → new-CM JWT ────────────────────
@@ -147,15 +224,24 @@ public class GetNewCmTokenApiGenerator implements Generator {
                 throw new GeneratorException("new-CM SSO HTTP " + resp.statusCode() + ": " + resp.body());
             }
             JsonNode root = mapper.readTree(resp.body());
-            if (!"OK".equals(root.path("status").asText())) {
+            // Two response formats observed:
+            // v1 (2026-09-15): {"status":"OK","data":{"token":"...","user":{"userName":"..."}}}
+            // v2 (2026-09-27): {"accessToken":"...","userName":"..."} — direct root-level fields
+            String cmToken;
+            String userName;
+            if ("OK".equals(root.path("status").asText())) {
+                JsonNode data = root.path("data");
+                cmToken  = data.path("token").asText(null);
+                userName = data.path("user").path("userName").asText(username);
+            } else if (!root.path("accessToken").isMissingNode()) {
+                cmToken  = root.path("accessToken").asText(null);
+                userName = root.path("userName").asText(username);
+            } else {
                 throw new GeneratorException("new-CM SSO thất bại: " + resp.body());
             }
-            JsonNode data    = root.path("data");
-            String cmToken   = data.path("token").asText(null);
             if (cmToken == null || cmToken.isBlank()) {
                 throw new GeneratorException("new-CM SSO không trả về token: " + resp.body());
             }
-            String userName  = data.path("user").path("userName").asText(username);
 
             return GenerationResult.builder(type())
                 .put("username", userName)
@@ -170,5 +256,69 @@ public class GetNewCmTokenApiGenerator implements Generator {
         } catch (Exception e) {
             throw new GeneratorException("new-CM SSO lỗi: " + e.getMessage(), e);
         }
+    }
+
+    // Selenium fallback khi CAS rate-limit pure HTTP login. Browser navigate đến new-CM,
+    // CAS tự redirect với ticket (nếu đã có TGT) hoặc hiện form login → LoginPage xử lý.
+    // JWT được lấy từ localStorage của page sau khi new-CM SPA khởi động xong.
+    // Intercept JS dùng để bắt JWT từ XHR/fetch header sau khi SPA đã login
+    private static final String INTERCEPT_JS =
+        "window._cmToken = null;" +
+        "var origXhrSet = XMLHttpRequest.prototype.setRequestHeader;" +
+        "XMLHttpRequest.prototype.setRequestHeader = function(h, v) {" +
+        "  if (h && h.toLowerCase() === 'authorization' && v && v.length > 100) {" +
+        "    window._cmToken = v.startsWith('Bearer ') ? v.substring(7) : v;" +
+        "  }" +
+        "  origXhrSet.apply(this, arguments);" +
+        "};" +
+        "var origFetch = window.fetch;" +
+        "window.fetch = function(url, opts) {" +
+        "  try {" +
+        "    var h = opts && opts.headers;" +
+        "    if (h) {" +
+        "      var auth = typeof h.get === 'function' ? h.get('Authorization') :" +
+        "                 (h['Authorization'] || h['authorization']);" +
+        "      if (auth && auth.length > 100) {" +
+        "        window._cmToken = auth.startsWith('Bearer ') ? auth.substring(7) : auth;" +
+        "      }" +
+        "    }" +
+        "  } catch(e) {}" +
+        "  return origFetch.apply(this, arguments);" +
+        "};";
+
+    private GenerationResult loginViaSeleniumForNewCm(String username, String password, long t0) {
+        String cmToken = automation.computeWithDriver(driver -> {
+            // Inject interceptor via CDP Page.addScriptToEvaluateOnNewDocument BEFORE navigation.
+            // executeScript() runs after DOMContentLoaded — too late because the SPA calls its
+            // auth API during initialization before the injected code is in place.
+            // CDP guarantees the script executes before any page-level JS on every navigation.
+            if (driver instanceof org.openqa.selenium.chromium.HasCdp cdpDriver) {
+                cdpDriver.executeCdpCommand(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    Map.of("source", INTERCEPT_JS));
+            }
+
+            // Login — interceptor now live for all navigations (CAS redirects → new-cm SPA load)
+            new LoginPage(driver).loginToUrl(NEW_CM_SERVICE + "/", username, password);
+
+            // Poll for JWT captured by interceptor during SPA initialization
+            for (int i = 0; i < 60; i++) {
+                String tok = (String) ((JavascriptExecutor) driver).executeScript(
+                    "return window._cmToken;");
+                if (tok != null && !tok.isBlank() && tok.startsWith("eyJ")) return tok;
+                try { Thread.sleep(500); } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt(); break;
+                }
+            }
+            throw new GeneratorException(
+                "Không capture được JWT từ new-CM sau 30s. " +
+                "CDP addScriptToEvaluateOnNewDocument injected nhưng SPA không gọi API nào có Authorization header.");
+        });
+        return GenerationResult.builder(type())
+            .put("username", username)
+            .put("cmToken", cmToken)
+            .put("method", "selenium-fallback (CDP-interceptor)")
+            .put("durationMs", System.currentTimeMillis() - t0)
+            .build();
     }
 }

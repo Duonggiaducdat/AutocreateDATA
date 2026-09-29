@@ -93,12 +93,23 @@ public class Cm1800ExecuteGenerator implements Generator {
                 .connectTimeout(Duration.ofSeconds(TIMEOUT_SECONDS)).build();
 
         // Step 1: lookup registration detail → crTransactionId + transactionId
+        // Retry vì new-CM có thể chưa kịp sync từ BMS ngay sau khi BGĐ approve
         String detailUrl = baseUrl + "/registrations/detail?requestCode=" + regCode;
-        trace(log, "GET " + detailUrl);
-        JsonNode detailResp = getJson(client, detailUrl, cmToken, log);
-        JsonNode reg = detailResp != null ? detailResp.path("data").path("registration") : null;
-        if (reg == null || reg.isMissingNode()) {
-            throw new GeneratorException("Không tìm thấy registration với regCode=" + regCode);
+        JsonNode reg = null;
+        int MAX_DETAIL_RETRY = 6;
+        for (int attempt = 1; attempt <= MAX_DETAIL_RETRY; attempt++) {
+            if (attempt > 1) {
+                trace(log, "new-CM chưa có " + regCode + ", chờ 5s thử lại (" + attempt + "/" + MAX_DETAIL_RETRY + ")…");
+                try { Thread.sleep(5000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+            }
+            trace(log, "GET " + detailUrl + " (attempt " + attempt + ")");
+            JsonNode detailResp = getJson(client, detailUrl, cmToken, log);
+            reg = detailResp != null ? detailResp.path("data").path("registration") : null;
+            if (reg != null && !reg.isMissingNode() && !reg.path("crTransactionId").asText("").isBlank()) break;
+            reg = null;
+        }
+        if (reg == null) {
+            throw new GeneratorException("Không tìm thấy registration với regCode=" + regCode + " trong new-CM sau " + MAX_DETAIL_RETRY + " lần thử (mỗi lần cách 5s)");
         }
 
         int currentStatus    = reg.path("status").asInt(-1);
