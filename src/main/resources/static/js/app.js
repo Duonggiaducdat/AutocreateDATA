@@ -1069,6 +1069,10 @@
       onclick: () => addTechRow(),
     }, '+ Thêm liên hệ kỹ thuật');
 
+    // Pre-fill 1 random row cho mỗi section ngay khi mount
+    addBillingRow();
+    addTechRow();
+
     // ----- Duyệt BGĐ + CM tự động sau khi Tạo (user request 2026-09-07:
     // "thêm bước BGĐ duyệt và cm duyệt vô luôn khi người dùng tick đi") —
     // tick mới chạy, mặc định TẮT vì đây là hành động phê duyệt thật, có
@@ -1080,7 +1084,13 @@
     // response Tạo trả về Mã YC (chưa quan sát được response thành công
     // thật của InsertRegistration để biết field đó tên gì).
     const autoApproveCheckbox = UI.h('input', { type: 'checkbox' });
-    const cmApproverInput = UI.h('input', { class: 'app-input', type: 'text', value: 'truongnv64', style: 'max-width: 200px; display: inline-block;' });
+    // bmsAdminInput: account đăng nhập BMS legacy để thực thi CheckServiceIntegrate + InsertRegistration
+    const bmsAdminInput = UI.h('input', { class: 'app-input', type: 'text', value: 'truongnv64', style: 'max-width: 180px; display: inline-block;' });
+    // bgdApproverInput: override account BGĐ duyệt — để trống sẽ dùng bgdUsername từ server (registration.lookup)
+    // Điền account cụ thể khi bgdUsername server trả về không thể login (vd: anhdc4 không hỗ trợ OTP)
+    const bgdApproverInput = UI.h('input', { class: 'app-input', type: 'text', value: 'DuyVM4', style: 'max-width: 180px; display: inline-block;', placeholder: 'để trống → lấy từ server' });
+    // cmApproverInput: account new-CM duyệt (ftms-stag/new-cm) — demstaff.am có quyền trên cả phone + 1800
+    const cmApproverInput = UI.h('input', { class: 'app-input', type: 'text', value: 'demstaff.am', style: 'max-width: 180px; display: inline-block;' });
 
     const status = UI.h('div', { class: 'autoflow-status' });
     const addLine = () => {
@@ -1098,8 +1108,8 @@
         const resp = await api.generate('registration.lookup', { bearerToken: token, regCode: opportunityCode });
         const d = resp.result.data;
         opportunityId = d.opportunityId;
-        bgdUsername = d.bgdUsername;
-        lookupLine.textContent = `✓ Tìm thấy ${opportunityId} — BGĐ phụ trách: ${bgdUsername}` + (d.alreadyApproved ? ' (đã duyệt BMS từ trước)' : '');
+        bgdUsername = bgdApproverInput.value.trim() || d.bgdUsername;
+        lookupLine.textContent = `✓ Tìm thấy ${opportunityId} — BGĐ phụ trách: ${bgdUsername}` + (bgdApproverInput.value.trim() ? ' (override)' : '') + (d.alreadyApproved ? ' (đã duyệt BMS từ trước)' : '');
       } catch (err) {
         lookupLine.textContent = '✗ Tra Mã YC lỗi: ' + (err.message || err);
         lookupLine.classList.add('is-error');
@@ -1126,7 +1136,7 @@
       try {
         const resp = await api.generate('registration.approve-bms', { bearerToken: bgdToken, opportunityId });
         regCodes = resp.result.data.regCodes || [];
-        approveLine.textContent = `✓ BMS duyệt xong (${resp.result.data.registrations.length} registration)`;
+        approveLine.textContent = `✓ BMS duyệt xong (${resp.result.data.registrations.length} registration) — CMR: ${regCodes.join(', ')}`;
       } catch (err) {
         approveLine.textContent = '✗ Duyệt BMS lỗi: ' + (err.message || err);
         approveLine.classList.add('is-error');
@@ -1135,36 +1145,38 @@
 
       if (regCodes.length === 0) {
         const line = addLine();
-        line.textContent = '⚠ Không tìm được Mã YC (regCode) nào để duyệt tiếp CM — dừng ở đây';
+        line.textContent = '⚠ Không tìm được Mã YC (CMR code) nào — dừng ở đây';
         line.classList.add('is-error');
         return;
       }
 
+      // Phone registration CÓ trong new-CM (CMR code từ approve-bms).
+      // Dùng new-CM (voice1800.cm-execute) với CMR code — confirmed live 2026-10-06.
       const cmEmail = toLoginEmail(cmApproverInput.value.trim());
       const cmLoginLine = addLine();
-      cmLoginLine.textContent = `⏳ Đăng nhập CM (${cmEmail})…`;
+      cmLoginLine.textContent = `⏳ Lấy new-CM token (${cmEmail})…`;
       let cmToken;
       try {
-        const { token, cached } = await getCachedOrFreshCmToken(cmEmail);
+        const { token, cached } = await getCachedOrFreshNewCmToken(cmEmail);
         cmToken = token;
-        cmLoginLine.textContent = cached ? `✓ Dùng lại token CM (${cmEmail}, còn hạn)` : `✓ Đăng nhập CM thành công (${cmEmail})`;
+        cmLoginLine.textContent = cached ? `✓ Dùng lại new-CM token (${cmEmail}, còn hạn)` : `✓ new-CM token OK (${cmEmail})`;
       } catch (err) {
-        cmLoginLine.textContent = '✗ Đăng nhập CM lỗi: ' + (err.message || err);
+        cmLoginLine.textContent = '✗ Lấy new-CM token lỗi: ' + (err.message || err);
         cmLoginLine.classList.add('is-error');
         return;
       }
 
       for (const regCode of regCodes) {
         const line = addLine();
-        line.textContent = `⏳ Đang duyệt CM cho ${regCode}…`;
+        line.textContent = `⏳ new-CM thực hiện YCHD ${regCode} (${cmEmail})…`;
         try {
-          const resp = await api.generate('registration.approve-cm', { cmToken, regCode });
+          const resp = await api.generate('voice1800.cm-execute', { cmToken, regCode });
           const d = resp.result.data;
           line.textContent = d.skipped
-            ? `✓ ${regCode} đã hoàn thành từ trước (hợp đồng ${d.contractNo || '?'})`
-            : `✓ ${regCode} duyệt CM xong — hợp đồng ${d.contractNo || '?'} / PL ${d.subContractNo || '?'}`;
+            ? `✓ ${regCode} đã hoàn thành từ trước (HĐ ${d.contractNo || '?'})`
+            : `✓ ${regCode} new-CM xong — HĐ ${d.contractNo || '?'}`;
         } catch (err) {
-          line.textContent = `✗ Duyệt CM lỗi cho ${regCode}: ` + (err.message || err);
+          line.textContent = `✗ new-CM lỗi cho ${regCode}: ` + (err.message || err);
           line.classList.add('is-error');
         }
       }
@@ -1183,29 +1195,44 @@
       }
     }
 
+    // Slots + shared sections cho các DOM element dùng chung giữa phoneFormBody
+    // và form1800Body. Vì 1 DOM node chỉ có 1 parent, cả 2 form không thể giữ
+    // cùng element cùng lúc — sharedXxxSection được move vào slot của form đang
+    // active bởi renderBodyForType() mỗi khi chuyển loại dịch vụ.
+    const phoneContractSlot  = UI.h('div', { style: 'display:contents' });
+    const v1800ContractSlot  = UI.h('div', { style: 'display:contents' });
+    const phoneDeploySlot    = UI.h('div', { style: 'display:contents' });
+    const v1800DeploySlot    = UI.h('div', { style: 'display:contents' });
+
+    const sharedContractSection = UI.h('div', { style: 'display:contents' },
+      field('Phân loại hợp đồng (TypeContract)', typeContractCategoryInput),
+      field('Vùng miền / Tỉnh thành', locationSelect, '8 = HCM, 4 = HN — dùng chung cho cả 2 bước'),
+      field('Hạn mức công nợ (ngày)', limitCreditDayInput),
+      field('Cước trả một lần', feeContractInput),
+      field('Cước tháng', monthlyFeeContractInput),
+      field('Kỳ hạn thanh toán (tháng)', dateContractMonthInput));
+
+    const sharedDeploySection = UI.h('div', { style: 'display:contents' },
+      UI.h('label', { class: 'd-block' },
+        UI.h('div', { class: 'field-label' }, UI.h('span', { class: 'lbl' }, 'Phường/Xã')),
+        wardSelect,
+        UI.h('div', { style: 'margin-top: 6px;' }, loadWardsButton, ' ', wardStatus)),
+      field('Số nhà, tên đường', locationNumberInput),
+      field('Người liên hệ', contactNameInput),
+      field('Điện thoại liên hệ', contactPhoneInput),
+      field('Email liên hệ', contactEmailInput),
+      field('Ngày hẹn triển khai', deployDateInput));
+
     const phoneFormBody = UI.h('div', { class: 'gen-body' },
       UI.h('div', { class: 'field-grid-3' },
-        field('Phân loại hợp đồng (TypeContract)', typeContractCategoryInput),
-        field('Vùng miền / Tỉnh thành', locationSelect, '8 = HCM, 4 = HN — dùng chung cho cả 2 bước'),
+        phoneContractSlot,
         field('Hình thức thanh toán', paymentMethodInput),
-        field('Hạn mức công nợ (ngày)', limitCreditDayInput),
-        field('Cước trả một lần', feeContractInput),
-        field('Cước tháng', monthlyFeeContractInput),
-        field('Kỳ hạn thanh toán (tháng)', dateContractMonthInput),
         field('Giá trị HĐ/PL', contractValueInput)),
       UI.h('div', { class: 'field-grid' },
         field('Ghi chú', notesInput),
         field('Mô tả', descriptionInput)),
       UI.h('div', { class: 'field-grid-3' },
-        UI.h('label', { class: 'd-block' },
-          UI.h('div', { class: 'field-label' }, UI.h('span', { class: 'lbl' }, 'Phường/Xã')),
-          wardSelect,
-          UI.h('div', { style: 'margin-top: 6px;' }, loadWardsButton, ' ', wardStatus)),
-        field('Số nhà, tên đường', locationNumberInput),
-        field('Người liên hệ', contactNameInput),
-        field('Điện thoại liên hệ', contactPhoneInput),
-        field('Email liên hệ', contactEmailInput),
-        field('Ngày hẹn triển khai', deployDateInput),
+        phoneDeploySlot,
         field('Auto Call', autoCallSelect),
         field('IP kết nối', ipMainInput),
         field('Nền tảng', platformSelect, 'đổi lại sẽ search số điện thoại theo nền tảng đó')),
@@ -1223,7 +1250,11 @@
         autoApproveCheckbox,
         UI.h('span', { class: 'lbl' }, 'Tự động duyệt BGĐ + CM ngay sau khi Tạo thành công'),
         UI.h('span', { class: 'hint' }, '— hành động phê duyệt thật, mặc định tắt'),
-        UI.h('span', null, 'Tài khoản CM duyệt:'),
+        UI.h('span', null, 'BMS legacy (Tạo):'),
+        bmsAdminInput,
+        UI.h('span', null, '  BGĐ duyệt:'),
+        bgdApproverInput,
+        UI.h('span', null, '  CM duyệt:'),
         cmApproverInput),
       status);
 
@@ -1334,7 +1365,7 @@
     const status1800 = UI.h('div', { class: 'gen-log' });
     const autoApprove1800 = UI.h('input', { type: 'checkbox' });
     const cmApprover1800 = UI.h('input', {
-      class: 'app-input', type: 'text', value: 'ThiTLH', style: 'width: auto;',
+      class: 'app-input', type: 'text', value: 'demstaff.am', style: 'width: auto;',
     });
 
     function addLine1800() {
@@ -1388,6 +1419,8 @@
         }
       }
     }
+
+    const ipMain1800Input = UI.h('input', { class: 'app-input', type: 'text', value: randIp() });
 
     const submit1800Button = UI.h('button', {
       class: 'btn-generate', type: 'button',
@@ -1463,7 +1496,7 @@
             dateContractMonth: parseInt(dateContractMonthInput.value, 10) || 1,
             limitCreditDay: parseInt(limitCreditDayInput.value, 10) || 30,
             effectiveDate: effectiveDate1800.value.trim(),
-            ipMain: ipMainInput.value.trim(),
+            ipMain: ipMain1800Input.value.trim(),
             portMain: portMain1800.value.trim(),
             voiceDirectionOpen: voiceDir1800.value.trim(),
             maxCall: parseInt(maxCall1800.value, 10) || 4,
@@ -1491,24 +1524,11 @@
     const form1800Body = UI.h('div', { class: 'gen-body' },
       UI.h('div', { class: 'field-grid-3' },
         field('Service ID', serviceId1800Input, 'GET /registration/{id} → .data.serviceId'),
-        field('Phân loại HĐ (TypeContract)', typeContractCategoryInput),
-        field('Vùng miền / Tỉnh thành', locationSelect),
-        field('Cước trả một lần (VNĐ)', feeContractInput),
-        field('Cước tháng (VNĐ)', monthlyFeeContractInput),
-        field('Kỳ hạn TT (tháng)', dateContractMonthInput),
-        field('Hạn mức công nợ (ngày)', limitCreditDayInput),
+        v1800ContractSlot,
         field('Ngày hiệu lực HĐ (YYYY-MM-DD)', effectiveDate1800)),
       UI.h('div', { class: 'field-grid-3' },
-        UI.h('label', { class: 'd-block' },
-          UI.h('div', { class: 'field-label' }, UI.h('span', { class: 'lbl' }, 'Phường/Xã triển khai')),
-          wardSelect,
-          UI.h('div', { style: 'margin-top: 6px;' }, loadWardsButton, ' ', wardStatus)),
-        field('District ID (địa chỉ thanh toán)', districtId1800Input, 'ward-id của billing address — vd: 1000009799'),
-        field('Số nhà, tên đường', locationNumberInput),
-        field('Người liên hệ triển khai', contactNameInput),
-        field('SĐT liên hệ TK', contactPhoneInput),
-        field('Email liên hệ TK', contactEmailInput),
-        field('Ngày hẹn triển khai (MM/DD/YYYY)', deployDateInput)),
+        v1800DeploySlot,
+        field('District ID (địa chỉ thanh toán)', districtId1800Input, 'ward-id của billing address — vd: 1000009799')),
       UI.h('label', { class: 'd-block' },
         UI.h('div', { class: 'field-label' },
           UI.h('span', { class: 'lbl' }, 'Đầu số 1800'),
@@ -1530,7 +1550,7 @@
       UI.h('fieldset', { style: 'border: 1px solid var(--ink-700); border-radius: 4px; padding: 10px; margin: 8px 0;' },
         UI.h('legend', { class: 'hint', style: 'padding: 0 6px;' }, 'Cấu hình đường truyền SIP'),
         UI.h('div', { class: 'field-grid-3' },
-          field('IP kết nối', ipMainInput),
+          field('IP kết nối', ipMain1800Input),
           field('Port SIP', portMain1800),
           field('Hướng cuộc gọi (mã phân cách ,)', voiceDir1800),
           field('Số CG tối đa', maxCall1800),
@@ -1620,7 +1640,7 @@
           ContactName: contactNameInput.value.trim(), ContactEmail: contactEmailInput.value.trim(), ContactPhone: contactPhoneInput.value.trim(),
           Address: deployAddress, Location: Number(locationSelect.value), District: Number(wardIdHidden.value || 0), Ward: 0, Country: '',
           FullAddress: `${deployAddress}, ${wardNameHidden.value}, ${locationNameHidden.value}`,
-          Id: 0, refCodeOfIntegrated: 'null', IsSelected: true,
+          Id: 0, refCodeOfIntegrated: refCode, IsSelected: true,
         }]);
         validateLine.textContent = '✓ ListMember hợp lệ · ' + billingContacts.length + ' liên hệ thu cước · ' + techContacts.length + ' liên hệ kỹ thuật';
 
@@ -1710,7 +1730,7 @@
           // ----- Bước 2/2: bms.insert-registration (Bước 3 "Tạo", legacy BMS) -----
           // Cần đăng nhập LẠI (vùng legacy BMS riêng — session bước 1 ở
           // trên KHÔNG dùng chung được, xem javadoc GetBmsLegacySessionGenerator).
-          const bmsAdminEmail = toLoginEmail(cmApproverInput.value.trim());
+          const bmsAdminEmail = toLoginEmail(bmsAdminInput.value.trim());
           const loginLine = addLine();
           loginLine.textContent = `⏳ Đăng nhập BMS legacy (${bmsAdminEmail})…`;
           let bearerToken, bmsCookieHeader;
@@ -1810,9 +1830,13 @@
       if (!meta || !meta.supported) {
         body.appendChild(unsupportedBody);
       } else if (meta.value === '1800') {
+        v1800ContractSlot.appendChild(sharedContractSection);
+        v1800DeploySlot.appendChild(sharedDeploySection);
         body.appendChild(form1800Body);
         footer.appendChild(submit1800Button);
       } else {
+        phoneContractSlot.appendChild(sharedContractSection);
+        phoneDeploySlot.appendChild(sharedDeploySection);
         body.appendChild(phoneFormBody);
         footer.appendChild(submitButton);
       }

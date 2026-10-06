@@ -6,6 +6,8 @@ import com.fpt.autodata.generator.GenerationResult;
 import com.fpt.autodata.generator.GeneratorException;
 import com.fpt.autodata.generator.ParamSpec;
 import com.fpt.autodata.generator.Params;
+import com.fpt.autodata.selenium.LoginPage;
+import com.fpt.autodata.service.automation.FtmsAutomation;
 import org.springframework.stereotype.Component;
 
 import java.net.CookieManager;
@@ -46,12 +48,14 @@ public class GetBmsLegacySessionApiGenerator implements Generator {
     private static final Pattern EXECUTION_PAT = Pattern.compile("name=\"execution\"\\s+value=\"([^\"]+)\"");
     private static final String LEGACY_COOKIE  = "FTIBMS-Auth";
 
-    private final Duration    timeout;
-    private final CasTgtCache tgtCache;
+    private final Duration       timeout;
+    private final CasTgtCache    tgtCache;
+    private final FtmsAutomation automation;
 
-    public GetBmsLegacySessionApiGenerator(AutodataProperties props, CasTgtCache tgtCache) {
-        this.timeout  = Duration.ofSeconds(props.getApi().getTimeoutSeconds());
-        this.tgtCache = tgtCache;
+    public GetBmsLegacySessionApiGenerator(AutodataProperties props, CasTgtCache tgtCache, FtmsAutomation automation) {
+        this.timeout    = Duration.ofSeconds(props.getApi().getTimeoutSeconds());
+        this.tgtCache   = tgtCache;
+        this.automation = automation;
     }
 
     @Override public String type()        { return "auth.get-bms-legacy-session-api"; }
@@ -178,6 +182,10 @@ public class GetBmsLegacySessionApiGenerator implements Generator {
                 if (postResp.statusCode() == 302) {
                     Matcher m = TICKET_PAT.matcher(postResp.headers().firstValue("location").orElse(""));
                     if (m.find()) ticket = m.group(1);
+                } else if (postResp.statusCode() == 401) {
+                    // Rate-limited → Selenium fallback
+                    tgtCache.invalidate(username);
+                    return loginViaSeleniumForBmsLegacy(username, password, refCode, t0);
                 }
             }
         } catch (Exception e) {
@@ -252,4 +260,34 @@ public class GetBmsLegacySessionApiGenerator implements Generator {
         }
     }
 
+    // Fallback Selenium khi CAS pure HTTP bị rate-limit (401).
+    // Navigate đến CreateRegist → CAS login (OTP) → redirect về BMS legacy → extract cookies.
+    private GenerationResult loginViaSeleniumForBmsLegacy(String username, String password, String refCode, long t0) {
+        String cookieHeader = automation.computeWithDriver(driver -> {
+            String targetUrl = CREATE_REGIST + refCode;
+            // Login via OTP vào BMS legacy URL
+            new LoginPage(driver).loginToUrl(targetUrl, username, password);
+            // Visit lần 2 để server set đủ FTIBMS + jwt_token_id (giống pure-API flow)
+            driver.get(targetUrl);
+            try { Thread.sleep(2000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            // Collect tất cả cookies
+            StringBuilder sb = new StringBuilder();
+            for (org.openqa.selenium.Cookie c : driver.manage().getCookies()) {
+                if (sb.length() > 0) sb.append("; ");
+                sb.append(c.getName()).append("=").append(c.getValue());
+            }
+            String header = sb.toString();
+            if (!header.contains(LEGACY_COOKIE)) {
+                throw new GeneratorException("Selenium BMS legacy: không tìm được " + LEGACY_COOKIE + " cookie sau login");
+            }
+            return header;
+        });
+        return GenerationResult.builder(type())
+            .put("username", username)
+            .put("refCode", refCode)
+            .put("cookieHeader", cookieHeader)
+            .put("method", "selenium-fallback (cas rate-limited)")
+            .put("durationMs", System.currentTimeMillis() - t0)
+            .build();
+    }
 }

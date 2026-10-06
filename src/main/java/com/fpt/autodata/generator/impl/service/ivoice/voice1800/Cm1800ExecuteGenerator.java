@@ -89,11 +89,17 @@ public class Cm1800ExecuteGenerator implements Generator {
 
         long t0 = System.currentTimeMillis();
         List<String> log = new ArrayList<>();
+        // Force HTTP/1.1 — Java HttpClient default HTTP/2 bị route sang "API CM V1"
+        // (backend cũ, trả 404) thay vì "FTI-CM Internal API" (backend mới, trả 200).
+        // curl và Python (HTTP/1.1) luôn hit đúng backend mới. Confirmed 2026-10-06.
         HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(TIMEOUT_SECONDS)).build();
+                .connectTimeout(Duration.ofSeconds(TIMEOUT_SECONDS))
+                .version(java.net.http.HttpClient.Version.HTTP_1_1)
+                .build();
 
         // Step 1: lookup registration detail → crTransactionId + transactionId
-        // Retry vì new-CM có thể chưa kịp sync từ BMS ngay sau khi BGĐ approve
+        // Retry vì new-CM có thể chưa kịp sync từ BMS ngay sau khi BGĐ approve.
+        // Cũng retry trên 404 vì routing issue có thể transient.
         String detailUrl = baseUrl + "/registrations/detail?requestCode=" + regCode;
         JsonNode reg = null;
         int MAX_DETAIL_RETRY = 6;
@@ -103,10 +109,21 @@ public class Cm1800ExecuteGenerator implements Generator {
                 try { Thread.sleep(5000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
             }
             trace(log, "GET " + detailUrl + " (attempt " + attempt + ")");
-            JsonNode detailResp = getJson(client, detailUrl, cmToken, log);
-            reg = detailResp != null ? detailResp.path("data").path("registration") : null;
-            if (reg != null && !reg.isMissingNode() && !reg.path("crTransactionId").asText("").isBlank()) break;
-            reg = null;
+            try {
+                JsonNode detailResp = getJson(client, detailUrl, cmToken, log);
+                reg = detailResp != null ? detailResp.path("data").path("registration") : null;
+                if (reg != null && !reg.isMissingNode() && !reg.path("crTransactionId").asText("").isBlank()) break;
+                reg = null;
+            } catch (GeneratorException e) {
+                // Retry on 404/NotFound — backend routing issue, transient
+                String msg = e.getMessage() != null ? e.getMessage() : "";
+                if (msg.contains("HTTP 404") || msg.contains("NotFound") || msg.contains("Không tìm thấy")) {
+                    trace(log, "404/NotFound từ new-CM (attempt " + attempt + ") — thử lại…");
+                    reg = null;
+                } else {
+                    throw e;
+                }
+            }
         }
         if (reg == null) {
             throw new GeneratorException("Không tìm thấy registration với regCode=" + regCode + " trong new-CM sau " + MAX_DETAIL_RETRY + " lần thử (mỗi lần cách 5s)");
@@ -147,14 +164,26 @@ public class Cm1800ExecuteGenerator implements Generator {
             trace(log, "contractNo=" + contractNo + " đã tồn tại, bỏ qua create-contract");
         }
 
-        // Step 3: check-registration pre-check
-        if (transactionId != null && !transactionId.isBlank()) {
+        // Step 3: check-registration pre-check — bỏ qua khi contractNo đã tồn tại
+        // (check-registration endpoint trả 404 cho phone registrations khi contract đã tạo trước đó,
+        // vì endpoint này chỉ có ý nghĩa trước khi create-contract).
+        if (!contractExists && transactionId != null && !transactionId.isBlank()) {
             String checkUrl = baseUrl + "/registrations/check-registration?transactionId=" + transactionId + "&newStatus=" + STATUS_HOAN_THANH;
             trace(log, "GET " + checkUrl);
-            JsonNode checkResp = getJson(client, checkUrl, cmToken, log);
-            if (checkResp != null && checkResp.path("data").path("isError").asBoolean(false)) {
-                throw new GeneratorException("check-registration cảnh báo lỗi: " + checkResp.path("data").path("message").asText());
+            try {
+                JsonNode checkResp = getJson(client, checkUrl, cmToken, log);
+                if (checkResp != null && checkResp.path("data").path("isError").asBoolean(false)) {
+                    throw new GeneratorException("check-registration cảnh báo lỗi: " + checkResp.path("data").path("message").asText());
+                }
+            } catch (GeneratorException e) {
+                if (e.getMessage() != null && (e.getMessage().contains("HTTP 404") || e.getMessage().contains("NotFound") || e.getMessage().contains("Không tìm thấy"))) {
+                    trace(log, "check-registration 404 — bỏ qua, tiếp tục update-status");
+                } else {
+                    throw e;
+                }
             }
+        } else if (contractExists) {
+            trace(log, "contractNo đã có, bỏ qua check-registration");
         }
 
         // Step 4: update status = 4 (Hoàn thành)
@@ -181,13 +210,45 @@ public class Cm1800ExecuteGenerator implements Generator {
                 .build();
     }
 
+    /**
+     * GET JSON dùng curl process — workaround cho Java TLS/routing issue:
+     * Java HttpClient + HttpURLConnection đều bị route sang "API CM V1" (404)
+     * dù cùng URL/token, trong khi curl luôn hit "FTI-CM Internal API" (200).
+     * Root cause chưa xác định (TLS cipher? SNI? connection pool?).
+     * Workaround: exec curl trực tiếp từ Java để đảm bảo routing đúng.
+     */
     private JsonNode getJson(HttpClient client, String url, String token, List<String> log) {
-        return send(client, HttpRequest.newBuilder()
-                .uri(URI.create(url))
-                .timeout(Duration.ofSeconds(TIMEOUT_SECONDS))
-                .header("Accept", "application/json, text/plain, */*")
-                .header("Authorization", "Bearer " + token)
-                .GET().build(), log);
+        try {
+            trace(log, "curl token prefix=" + (token != null && token.length() > 30 ? token.substring(0, 30) : token)
+                + " len=" + (token != null ? token.length() : 0));
+            ProcessBuilder pb = new ProcessBuilder(
+                "curl", "-s", "-m", String.valueOf(TIMEOUT_SECONDS),
+                "-H", "Accept: application/json, text/plain, */*",
+                "-H", "Authorization: Bearer " + token,
+                url
+            );
+            pb.redirectErrorStream(false);
+            Process proc = pb.start();
+            String body = new String(proc.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            int exitCode = proc.waitFor();
+            trace(log, "-> curl exit=" + exitCode + " body_start=" + body.substring(0, Math.min(100, body.length())));
+            JsonNode parsed = parseQuietly(body);
+            if (parsed == null) {
+                throw new GeneratorException("new-cm API: curl trả response không parse được (exit=" + exitCode + "): " + body.substring(0, Math.min(200, body.length())));
+            }
+            String status = parsed.path("status").asText("NOTOK");
+            if (!"OK".equalsIgnoreCase(status)) {
+                String errMsg = parsed.path("error").path("message").asText(parsed.toString());
+                trace(log, "response: " + body);
+                throw new GeneratorException("new-cm API HTTP error (curl): " + errMsg,
+                    HttpStatus.NOT_FOUND, null);
+            }
+            return parsed;
+        } catch (GeneratorException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new GeneratorException("Không gọi được new-CM: " + e.getMessage(), HttpStatus.BAD_GATEWAY, e);
+        }
     }
 
     private JsonNode postJson(HttpClient client, String url, String token, String body, List<String> log) {

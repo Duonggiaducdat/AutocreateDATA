@@ -162,30 +162,42 @@ public class Approve1800RegistrationGenerator implements Generator {
         }
     }
 
+    // Retry up to 4 times with 2 s delay — CMR code may not appear immediately
+    // after BGĐ approval (same race condition as ApproveRegistrationGenerator).
     private String lookupRegCode(HttpClient client, String baseUrl, String bearerToken,
             String opportunityId, int registrationId, List<String> log) {
-        try {
-            String url = baseUrl + "/approval-opportunities/registration-opportunity";
-            Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("keyword", opportunityId);
-            payload.put("approvalStatus", APPROVED);
-            payload.put("pageIndex", 1);
-            payload.put("pageSize", 20);
-            JsonNode resp = postJson(client, url, bearerToken, toJson(payload), log);
-            JsonNode rows = resp != null ? resp.path("data").path("data") : null;
-            if (rows != null && rows.isArray()) {
-                for (JsonNode r : rows) {
-                    if (r.path("registrationId").asInt(-1) == registrationId) {
-                        String ref = r.path("refCode").asText(null);
-                        if (ref != null) {
-                            trace(log, "regCode=" + ref + " cho registrationId=" + registrationId);
-                            return ref;
+        int maxAttempts = 4;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                if (attempt > 1) {
+                    trace(log, "regCode chưa có, chờ 2s rồi thử lại (lần " + attempt + "/" + maxAttempts + ")…");
+                    Thread.sleep(2000);
+                }
+                String url = baseUrl + "/approval-opportunities/registration-opportunity";
+                Map<String, Object> payload = new LinkedHashMap<>();
+                payload.put("keyword", opportunityId);
+                payload.put("approvalStatus", APPROVED);
+                payload.put("pageIndex", 1);
+                payload.put("pageSize", 20);
+                JsonNode resp = postJson(client, url, bearerToken, toJson(payload), log);
+                JsonNode rows = resp != null ? resp.path("data").path("data") : null;
+                if (rows != null && rows.isArray()) {
+                    for (JsonNode r : rows) {
+                        if (r.path("registrationId").asInt(-1) == registrationId) {
+                            String ref = r.path("refCode").asText(null);
+                            if (ref != null) {
+                                trace(log, "regCode=" + ref + " cho registrationId=" + registrationId);
+                                return ref;
+                            }
                         }
                     }
                 }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (RuntimeException e) {
+                trace(log, "lookup regCode lỗi (attempt " + attempt + "): " + e.getMessage());
             }
-        } catch (RuntimeException e) {
-            trace(log, "lookup regCode lỗi: " + e.getMessage());
         }
         return null;
     }
