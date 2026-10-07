@@ -133,41 +133,61 @@ public class Cm1800ExecuteGenerator implements Generator {
         String crTransactionId = reg.path("crTransactionId").asText(null);
         String transactionId   = reg.path("transactionId").asText(null);
         String contractNo      = reg.path("contractNo").asText(null);
+        // isContractTemp: 1 = SỐ HĐ TẠM (mới reserve ở bước BGĐ duyệt BMS, CHƯA finalize),
+        // 2 = HĐ thật đã finalize. cmrSubContractNo (số phụ lục) chỉ có sau khi create-contract
+        // finalize thành công. "Đã finalize" = cả 2 điều kiện → cũng là lúc BMS nhận "DEM phê duyệt".
+        int isContractTemp     = reg.path("isContractTemp").asInt(0);
+        String subContractNo   = reg.path("cmrSubContractNo").asText(null);
+        boolean contractFinalized = isContractTemp == 2
+                && subContractNo != null && !subContractNo.isBlank();
 
         if (crTransactionId == null || crTransactionId.isBlank()) {
             throw new GeneratorException("regCode=" + regCode + " chưa có crTransactionId — chưa qua bước BMS approve?");
         }
-        trace(log, "regCode=" + regCode + " crTransactionId=" + crTransactionId + " status=" + currentStatus);
+        trace(log, "regCode=" + regCode + " crTransactionId=" + crTransactionId
+                + " status=" + currentStatus + " isContractTemp=" + isContractTemp + " subContractNo=" + subContractNo);
 
-        if (currentStatus == STATUS_HOAN_THANH) {
-            trace(log, "status=4 (Hoàn thành) — bỏ qua, đã xong");
+        // Chỉ bỏ qua khi ĐÃ finalize thật (status=4 + HĐ thật + có phụ lục) — lúc đó BMS cũng
+        // đã nhận "DEM phê duyệt". Nếu status=4 nhưng HĐ vẫn TẠM (chưa có phụ lục) thì KHÔNG
+        // bỏ qua: đó chính là ca "new-cm Hoàn Thành nhưng BMS kẹt Chờ DEM duyệt", cần chạy tiếp
+        // create-contract để finalize + đồng bộ BMS.
+        if (currentStatus == STATUS_HOAN_THANH && contractFinalized) {
+            trace(log, "status=4 + HĐ đã finalize (phụ lục=" + subContractNo + ") — bỏ qua, đã xong & đã đồng bộ BMS");
             return result()
                     .put("regCode", regCode)
                     .put("skipped", true)
                     .put("contractNo", contractNo)
+                    .put("subContractNo", subContractNo)
                     .put("status", currentStatus)
                     .log(log)
                     .durationMs(System.currentTimeMillis() - t0)
                     .build();
         }
 
-        // Step 2: create contract
-        boolean contractExists = contractNo != null && !contractNo.isBlank();
-        if (!contractExists) {
+        // Step 2: create-contract (tạo HĐ & phụ lục) — ĐÂY là bước đồng bộ "DEM phê duyệt"
+        // về BMS (cmApprovalStatus 2→1, statusRegistName "Chờ DEM duyệt"→"DEM phê duyệt",
+        // set performer/completeDate). contractNo có thể là SỐ HĐ TẠM cấp sẵn từ bước BGĐ
+        // duyệt (BMS) — KHÔNG đồng nghĩa HĐ đã tạo. Chỉ khi create-contract chạy, HĐ mới
+        // finalize (isContractTemp 1→2), sinh số phụ lục + deploymentCode và BMS mới nhận DEM
+        // phê duyệt. Guard cũ theo contractNo nên luôn bỏ qua ở luồng điện thoại (có HĐ tạm
+        // sẵn) → BMS kẹt. Confirmed 2026-10-07: CH00086126 (create-contract chạy → synced)
+        // vs CH00086259 (bị bỏ qua → kẹt "Chờ DEM duyệt"). Xem memory/newcm-dem-bms-sync.
+        if (!contractFinalized) {
             Map<String, Object> createBody = new LinkedHashMap<>();
             createBody.put("cmrTransactionId", crTransactionId);
             createBody.put("noteOfApprover", noteOfApprover);
             String createUrl = baseUrl + "/registrations/create-contract";
-            trace(log, "POST " + createUrl + " cmrTransactionId=" + crTransactionId);
+            trace(log, "POST " + createUrl + " cmrTransactionId=" + crTransactionId
+                    + " (isContractTemp=" + isContractTemp + " → finalize + đồng bộ BMS)");
             postJson(client, createUrl, cmToken, toJson(createBody), log);
         } else {
-            trace(log, "contractNo=" + contractNo + " đã tồn tại, bỏ qua create-contract");
+            trace(log, "HĐ đã finalize (phụ lục=" + subContractNo + "), bỏ qua create-contract");
         }
 
         // Step 3: check-registration pre-check — bỏ qua khi contractNo đã tồn tại
         // (check-registration endpoint trả 404 cho phone registrations khi contract đã tạo trước đó,
         // vì endpoint này chỉ có ý nghĩa trước khi create-contract).
-        if (!contractExists && transactionId != null && !transactionId.isBlank()) {
+        if (!contractFinalized && transactionId != null && !transactionId.isBlank()) {
             String checkUrl = baseUrl + "/registrations/check-registration?transactionId=" + transactionId + "&newStatus=" + STATUS_HOAN_THANH;
             trace(log, "GET " + checkUrl);
             try {
@@ -182,8 +202,8 @@ public class Cm1800ExecuteGenerator implements Generator {
                     throw e;
                 }
             }
-        } else if (contractExists) {
-            trace(log, "contractNo đã có, bỏ qua check-registration");
+        } else if (contractFinalized) {
+            trace(log, "HĐ đã finalize, bỏ qua check-registration");
         }
 
         // Step 4: update status = 4 (Hoàn thành)
@@ -203,6 +223,8 @@ public class Cm1800ExecuteGenerator implements Generator {
                 .put("regCode", regCode)
                 .put("skipped", false)
                 .put("contractNo", finalReg != null ? finalReg.path("contractNo").asText(null) : contractNo)
+                .put("subContractNo", finalReg != null ? finalReg.path("cmrSubContractNo").asText(null) : subContractNo)
+                .put("isContractTemp", finalReg != null ? finalReg.path("isContractTemp").asInt(isContractTemp) : isContractTemp)
                 .put("status", STATUS_HOAN_THANH)
                 .put("statusName", "Hoàn thành")
                 .log(log)
@@ -221,8 +243,14 @@ public class Cm1800ExecuteGenerator implements Generator {
         try {
             trace(log, "curl token prefix=" + (token != null && token.length() > 30 ? token.substring(0, 30) : token)
                 + " len=" + (token != null ? token.length() : 0));
+            // --noproxy "*": đi TRỰC TIẾP, KHÔNG qua proxy. Môi trường có https_proxy
+            // trỏ proxy.hcm.fpt.vn và no_proxy dùng glob "*.fpt.net" — nhưng curl KHÔNG
+            // hiểu glob "*" trong no_proxy (curl cần ".fpt.net"), nên curl lại tunnel qua
+            // proxy và proxy không resolve được host staging → 503 ERR_DNS_FAIL → exit 7.
+            // ftisapi-stag.fpt.net chỉ truy cập được trực tiếp. Confirmed 2026-10-07.
             ProcessBuilder pb = new ProcessBuilder(
                 "curl", "-s", "-m", String.valueOf(TIMEOUT_SECONDS),
+                "--noproxy", "*",
                 "-H", "Accept: application/json, text/plain, */*",
                 "-H", "Authorization: Bearer " + token,
                 url
