@@ -16,17 +16,34 @@ short-lived fine-grained PAT passed on the command line only, never stored in
 anymore, consider deleting or archiving it — its history still contains the
 old (now-dead) token.
 
-## 🟡 Reviewer credentials in application.yml
+## 🟢 Reviewer credentials in application.yml — RESOLVED 2026-10-29
 
-`application.yml` has (or had) an `autodata.defaults.reviewer-username` /
-`reviewer-password` block with a real BMS login (`reviewer01@fpt.com` /
-password in plaintext). This file is tracked in git. Same risk category as
-the PAT above — anyone with repo access has the password in plaintext, and
-`git log` keeps it even if it's later removed from the working tree.
+`application.yml` used to carry an `autodata.defaults.reviewer-username` /
+`reviewer-password` block with a real BMS login + a real STG OTP-bypass
+password in plaintext, tracked in git since the initial commit. Before
+making the repo public:
 
-**Recommended fix:** move to environment variables (`${AUTODATA_REVIEWER_PASSWORD}`
-in the yml, actual value in a local `.env`/secret store, never committed),
-and rotate the password since it's already been exposed in history.
+1. **`application.yml` fixed** — both now read from env vars
+   (`${AUTODATA_REVIEWER_USERNAME:}` / `${AUTODATA_REVIEWER_PASSWORD:}`),
+   empty default. Set the real values locally via a gitignored `.env` /
+   shell profile, never commit them.
+2. **Every real FPT employee username/email and the real OTP-bypass code
+   were redacted from the ENTIRE git history** (not just the working tree —
+   `git log -p` kept the old password even after step 1), then force-pushed.
+   Role names are now generic placeholders (`sale01`, `admin01`, `bgd01`,
+   `tpp01`-`tpp05`, `reviewer01`, `qatester01`) throughout code, memory docs,
+   and comments.
+3. **Known side-effect:** `pages/CreatePage.java`'s `chooseProve` /
+   `scrollProveOptions` / `chooseReview` locators matched literal display
+   text rendered by the real BMS UI (an approver's real name, e.g.
+   `"Bgd01 - BGD01"`). Those literals are now redacted placeholders
+   and will **not** match the real UI anymore. If you resume driving this
+   exact legacy Selenium flow against a real STG account, restore the real
+   display text in those 3 `By` locators locally — don't recommit it.
+
+**Still to do (not something I can do from here):** the real password was
+already live on STG and exposed in this history — **rotate/change it** with
+whoever administers FTMS STG auth, independent of the git cleanup above.
 
 ## 🟡 `backend/screenshots/` — 50+ error screenshots, not investigated
 

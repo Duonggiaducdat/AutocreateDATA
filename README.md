@@ -1,6 +1,19 @@
 # Auto-Create DATA · Backend
 
-Production-grade fullstack wrapper around the existing FTMS Selenium tool.
+A Spring Boot tool that generates/drives test data end-to-end through FPT's
+internal BMS/IVOICE/CM staging systems — built to replace slow, flaky manual
+QA data setup.
+
+**Approach evolved mid-project, and the code is organized to show that
+evolution, not hide it:** it started as pure Selenium (click through every
+wizard step like a human tester), which worked but was slow and brittle
+(every UI change broke a locator). Once the real REST contracts behind each
+screen were reverse-engineered (captured from DevTools, documented in
+[`memory/api-contracts.md`](memory/api-contracts.md)), most flows were
+rewritten as direct `HttpClient` calls — Selenium only remains where it's
+genuinely unavoidable: the login/OTP step, which only a real browser session
+can complete, used solely to mint a token/cookie that the direct-API calls
+then reuse.
 
 ```
 backend/
@@ -10,8 +23,11 @@ backend/
     ├── controller/            REST endpoints + global error handler
     ├── service/               GeneratorRegistry, GenerationService, automation/
     ├── generator/             Strategy interface + DTOs
-    │   └── impl/              One @Component per generator (auto-discovered)
+    │   ├── selenium/          Original approach: full browser automation (one @Component per wizard step/flow), drives pages/*.java Page Objects
+    │   ├── auth/              Bridge layer: Selenium ONLY for the login/OTP wall — mints a bearer token / cookie jar, nothing else
+    │   └── api/               Current approach: pure HttpClient, no browser — direct calls against the reverse-engineered REST contracts
     └── model/                 Request/response DTOs
+├── src/main/java/pages/       Selenium Page Objects (used by generator/selenium + generator/auth only)
 └── src/main/resources/static/ Frontend: HTML + Bootstrap 5 + Vanilla JS
     ├── index.html
     ├── styles/main.css
@@ -26,9 +42,13 @@ that before extending the tool.
 
 ## Architecture in 30 seconds
 
-- **Strategy + factory.** Every data type is a `Generator` implementation. `GeneratorRegistry` collects all `@Component`-annotated `Generator` beans into a `Map<String, Generator>` keyed by `type()`. To add a new generator, drop a class in `generator/impl/` — no other wiring.
+- **Strategy + factory.** Every data type is a `Generator` implementation. `GeneratorRegistry` collects all `@Component`-annotated `Generator` beans into a `Map<String, Generator>` keyed by `type()`. To add a new generator, drop a class in the right `generator/` sub-package — no other wiring.
+- **Three generator sub-packages, one evolution story:**
+  - `generator/selenium/` — the original click-through-the-UI approach (extends `AbstractGenerator`, injects `FtmsAutomation`, drives a `pages.*` Page Object).
+  - `generator/auth/` — also Selenium-backed, but scoped to *only* the login/OTP step; its output (a token or cookie jar) is what makes `generator/api/` possible.
+  - `generator/api/` — the current approach for every flow whose real REST contract is confirmed: implements `Generator` directly, one or more `java.net.http.HttpClient` calls, no browser at all.
 - **Self-describing catalog.** Each generator publishes its parameter list via `ParamSpec` (text, password, number, enum, multi-enum, boolean). The frontend renders form fields purely from this metadata, so backend changes propagate automatically — zero hardcoded UI.
-- **Layered.** `controller → service → generator → automation facade → page objects`. Each layer has one job.
+- **Layered.** `controller → service → generator → (automation facade + page objects) | (HttpClient)`. Each layer has one job.
 - **Stable error envelope.** `GlobalExceptionHandler` maps every exception to `ApiError {timestamp, status, error, message, path}`.
 
 ---
@@ -84,36 +104,37 @@ visit `http://localhost:8080` directly, no separate frontend server needed.
 
 ## Adding a new generator
 
-Naming convention: class `PascalCaseGenerator` in `generator/impl/`, `type()`
-is a lowercase dotted key `domain.action` (e.g. `opportunity.step1`,
-`auth.get-token`), grouped under a `category()` for the UI (e.g.
-`Authentication`, `Opportunity`, `IDC`).
+Naming convention: class `PascalCaseGenerator`, `type()` is a lowercase
+dotted key `domain.action` (e.g. `opportunity.step1`, `auth.get-token`),
+grouped under a `category()` for the UI (e.g. `Authentication`,
+`Opportunity`, `IDC`).
 
-1. Create `src/main/java/com/fpt/autodata/generator/impl/MyThingGenerator.java`:
+**Pick the sub-package that matches the real contract, not habit:**
 
-```java
-@Component
-public class MyThingGenerator extends AbstractGenerator {
-    public MyThingGenerator(FtmsAutomation a) { super(a); }
-    @Override public String type()        { return "my.thing"; }
-    @Override public String displayName() { return "My Thing"; }
-    @Override public String category()    { return "Custom"; }
-    @Override public List<ParamSpec> params() {
-        return List.of(ParamSpec.text("foo").required().defaultValue("bar"));
-    }
-    @Override public GenerationResult generate(Map<String, Object> p) {
-        String foo = Params.requireString(p, "foo");
-        return result().put("foo", foo).build();
-    }
-}
-```
+- **`generator/api/`** — prefer this. If the real BMS/IVOICE/CM REST contract behind a screen has been confirmed (captured via DevTools, documented in [`memory/api-contracts.md`](memory/api-contracts.md)), implement `Generator` directly and call it with `java.net.http.HttpClient`. No browser, seconds instead of ~10-15s per step.
 
-2. Restart backend. The card appears in the UI automatically — no frontend changes needed.
+  ```java
+  @Component
+  public class MyThingGenerator implements Generator {
+      @Override public String type()        { return "my.thing"; }
+      @Override public String displayName() { return "My Thing"; }
+      @Override public String category()    { return "Custom"; }
+      @Override public List<ParamSpec> params() {
+          return List.of(ParamSpec.text("foo").required().defaultValue("bar"));
+      }
+      @Override public GenerationResult generate(Map<String, Object> p) {
+          // build request, HttpClient.send(...), parse response
+      }
+  }
+  ```
 
-Two implementation patterns coexist — see
-[`memory/architecture.md`](memory/architecture.md) before choosing one:
-- **Selenium generator** (most existing ones): extend `AbstractGenerator`, inject `FtmsAutomation`, drive a `pages.*` Page Object.
-- **Direct-API generator** (e.g. `OpportunityApiGenerator`): implement `Generator` directly, no browser, one HTTP call via `java.net.http.HttpClient`. Only where the real BMS REST contract is confirmed — document it in [`memory/api-contracts.md`](memory/api-contracts.md).
+- **`generator/selenium/`** — only when no REST contract is known yet (or the screen genuinely can't be reverse-engineered). Extend `AbstractGenerator`, inject `FtmsAutomation`, drive a `pages.*` Page Object.
+
+- **`generator/auth/`** — only for login/OTP-wall generators whose entire purpose is minting a token/cookie for `generator/api/` callers to reuse. Also extends `AbstractGenerator`.
+
+Restart the backend and the card appears in the UI automatically — no
+frontend changes needed, since the UI renders purely from each generator's
+`ParamSpec` list.
 
 ---
 

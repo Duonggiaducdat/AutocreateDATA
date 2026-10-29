@@ -49,9 +49,12 @@ autodata:
     base-url: https://ftisapi-stag.fpt.net/bms-service/api
     timeout-seconds: 15
   # Default credentials surface as form defaults — overridable per request.
+  # Real values must never be committed: set them via env vars locally
+  # (e.g. in a local, gitignored .env or your shell profile). See
+  # memory/known-issues.md for why this changed from a hardcoded value.
   defaults:
-    reviewer-username: reviewer01@fpt.com
-    reviewer-password: REDACTED_OTP_CODE
+    reviewer-username: ${AUTODATA_REVIEWER_USERNAME:}
+    reviewer-password: ${AUTODATA_REVIEWER_PASSWORD:}
 
 logging:
   level:
