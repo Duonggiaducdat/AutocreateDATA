@@ -34,7 +34,7 @@ public class AdvanceStageGenerator extends AbstractGenerator {
     @Override
     public List<ParamSpec> params() {
         return List.of(
-                ParamSpec.text("username").required().placeholder("VD: Sale02@fpt.com"),
+                ParamSpec.text("username").required().placeholder("VD: sale02@fpt.com"),
                 ParamSpec.password("otp").required().defaultValue("REDACTED_OTP_CODE").hint("OTP tinh tren staging"),
                 ParamSpec.text("chCode").required().placeholder("VD: CH00084632"),
                 ParamSpec.text("stages").required()
